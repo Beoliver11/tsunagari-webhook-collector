@@ -4,7 +4,10 @@
  * - "Oi/Olá" => responde com a mensagem EXATA do Notion (Mensagem de boas vindas:)
  * - Outras dúvidas => recupera trechos do Notion + OpenAI (sem inventar)
  *
- * Próximas fases: reservas + Trello (estado de conversa)
+ * Ajustes:
+ * - NÃO usa nome do cliente
+ * - NÃO inicia respostas com "Olá/Oi" (exceto boas-vindas)
+ * - NÃO encerra com despedidas ("aproveite seu dia" etc.)
  */
 
 const http = require("http");
@@ -212,13 +215,20 @@ function simpleRetrieve(question, knowledgeRows, k = 12) {
 }
 
 // ===== OpenAI (Responses API) =====
-async function openaiAnswer({ question, pushName, retrieved }) {
+async function openaiAnswer({ question, retrieved }) {
   const sys = `
-Você é a Liz, assistente do restaurante Tsunagari.
+Você é a Liz, assistente do restaurante Tsunagari (WhatsApp).
 
-Regras obrigatórias:
+Regras obrigatórias de estilo:
 - Tom sempre carinhoso, educado e calmo, mesmo se o cliente for grosseiro.
-- Não invente preços, promoções, regras ou informações. Se não estiver nas informações fornecidas, peça esclarecimento ou diga que vai confirmar.
+- NÃO use o nome do cliente.
+- NÃO comece com "Olá", "Oi", "Oie" etc. (a conversa já está em andamento).
+- NÃO encerre com frases de despedida tipo "aproveite o dia", "tenha um ótimo dia", "até mais".
+- Termine de forma aberta e útil: convide o cliente a continuar (ex.: "Se quiser, posso te ajudar com mais alguma coisa 😊").
+
+Regras de veracidade:
+- Não invente preços, promoções, regras ou informações.
+- Se a informação não estiver nos trechos fornecidos, peça esclarecimento ou diga que vai confirmar.
 - Seja curta e objetiva (WhatsApp), mas completa.
 - Pode usar emojis leves (🙏😊✨🍣❤️), sem exagero.
 `.trim();
@@ -228,7 +238,7 @@ Regras obrigatórias:
     .join("\n\n");
 
   const user = `
-Mensagem do cliente (nome no WhatsApp: ${pushName || "não informado"}):
+Mensagem do cliente:
 ${question}
 
 Informações do restaurante (trechos do Notion):
@@ -255,13 +265,20 @@ ${context || "(nenhuma informação relevante encontrada)"}
   if (!r.ok) throw new Error(`OpenAI failed ${r.status}: ${JSON.stringify(j)}`);
 
   const out = (j.output || []).flatMap((o) => o.content || []);
-  const text = out
+  let text = out
     .filter((c) => c.type === "output_text")
     .map((c) => c.text)
     .join("")
     .trim();
 
-  return text || "Perfeito! 😊 Como posso te ajudar?";
+  // Cintos de segurança:
+  text = text.replace(/^(oi|ol[aá]|oie+)\b[!,. \n-]*/i, "");
+  text = text.replace(
+    /\b(aproveite( o)? seu dia|tenha um (otimo|ótimo) dia|ate mais|até mais)\b\.?\s*$/i,
+    ""
+  );
+
+  return text.trim() || "Perfeito! 😊 Como posso te ajudar?";
 }
 
 // ===== HTTP server =====
@@ -296,9 +313,7 @@ const server = http.createServer((req, res) => {
       if (bodyJson?.data?.key?.fromMe) return;
 
       const remoteJid = bodyJson?.data?.key?.remoteJid;
-      const pushName = bodyJson?.data?.pushName || "";
       const incomingText = extractIncomingText(bodyJson);
-
       if (!remoteJid || !incomingText) return;
 
       await ensureKnowledgeFresh();
@@ -315,7 +330,7 @@ const server = http.createServer((req, res) => {
 
       // 2) Dúvidas gerais
       const retrieved = simpleRetrieve(incomingText, KNOWLEDGE, 12);
-      const answer = await openaiAnswer({ question: incomingText, pushName, retrieved });
+      const answer = await openaiAnswer({ question: incomingText, retrieved });
       await evolutionSendText({ remoteJid, text: answer });
       console.log("answered", remoteJid, "q:", incomingText);
     } catch (e) {
