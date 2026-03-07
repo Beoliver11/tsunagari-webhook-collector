@@ -1,3 +1,18 @@
+/**
+ * Tsunagari WhatsApp Bot (Evolution + Notion + Trello + OpenAI)
+ * - Reservation flow: collects Nome / Data / Horário / Adultos+Crianças (ou total fallback)
+ * - Creates Trello card per date-list
+ * - General Q&A: retrieve from Notion + OpenAI
+ *
+ * Fixes included:
+ * - Greeting detection robust: "Olá," / "Olá!" works
+ * - Name parsing: captures full name (not only first word) + smart inference when user sends all fields together
+ * - People parsing: keeps adults/children (does not sum to just total); uses total only as fallback
+ * - Hour max: responds softly suggesting RESERVA_HORA_MAX and waits confirmation ("ok/sim/pode") to set it
+ * - Link handling: if user didn't ask for link, remove it fully; if asked, convert markdown links to plain URL
+ * - PORT support for EasyPanel: uses process.env.PORT
+ */
+
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
@@ -51,7 +66,7 @@ function normalizeText(s) {
     .trim();
 }
 
-// FIX: saudação robusta ("Olá,", "Olá!" etc)
+// robust greeting ("Olá,", "Olá!" etc)
 function looksLikeGreeting(text) {
   const t = normalizeText(text);
   return /^(oi|ola|oie+|bom dia|boa tarde|boa noite)\b/.test(t);
@@ -252,7 +267,7 @@ function simpleRetrieve(question, knowledgeRows, k = 12) {
   return scored.slice(0, k).map((x) => x.row);
 }
 
-// ===== Answer sanitization =====
+// ===== Link / answer sanitization =====
 function shouldAllowLinks(question) {
   const q = normalizeText(question);
   return (
@@ -266,17 +281,18 @@ function shouldAllowLinks(question) {
   );
 }
 
-function stripLinks(text) {
-  let t = text || "";
-  // remove markdown links inteiros
-  t = t.replace(/\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/gi, "");
-  // remove urls soltas
-  t = t.replace(/https?:\/\/\S+/gi, "");
-  return t;
+function unmarkdownLinks(t) {
+  // "[cardápio](https://...)" => "https://..."
+  return (t || "").replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/gi, "$2");
 }
 
-function unmarkdownLinks(t) {
-  return (t || "").replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/gi, "$2");
+function stripLinks(text) {
+  let t = text || "";
+  // remove markdown links entirely
+  t = t.replace(/\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/gi, "");
+  // remove raw urls
+  t = t.replace(/https?:\/\/\S+/gi, "");
+  return t;
 }
 
 function sanitizeAnswer(text, question) {
@@ -286,16 +302,9 @@ function sanitizeAnswer(text, question) {
   t = t.replace(
     /^(oi|ol[aá]|oie+)\s*[!,.:;\-–—]*\s*(?:[A-Za-zÀ-ÿ0-9_.-]{2,30})?\s*[!,.:;\-–—]*\s*/i,
     ""
-
-if (shouldAllowLinks(question)) {
-  t = unmarkdownLinks(t);
-} else {
-  t = stripLinks(t);
-}
-    
   );
 
-  // remove “despedidas”
+  // remove closings
   const closings = [
     /\babracos\b\.?\s*$/i,
     /\babraços\b\.?\s*$/i,
@@ -314,9 +323,14 @@ if (shouldAllowLinks(question)) {
     if (t !== before) changed = true;
   }
 
-  if (!shouldAllowLinks(question)) {
-    t = stripLinks(t).replace(/\s+ /g, " ").trim();
+  if (shouldAllowLinks(question)) {
+    t = unmarkdownLinks(t);
+  } else {
+    t = stripLinks(t);
   }
+
+  // clean extra spaces/blank lines
+  t = t.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
   return t.trim();
 }
 
@@ -406,7 +420,7 @@ function parseTime(text) {
   return `${m[1].padStart(2, "0")}:${m[2]}`;
 }
 
-// FIX: pegar nome completo após "Nome:"
+// "Nome: Bernardo Oliveira" => full
 function parseName(text) {
   const m = text.match(/nome\s*[:\-]\s*([^\n\r]+)/i);
   if (m) return m[1].trim();
@@ -417,7 +431,7 @@ function parseName(text) {
   return null;
 }
 
-// FIX: quando o cliente manda tudo junto (nome + data/hora...), inferir nome
+// infer name if message starts with name then has date/time later
 function parseNameSmart(text) {
   const explicit = parseName(text);
   if (explicit) return explicit;
@@ -448,7 +462,6 @@ function parseNameSmart(text) {
   return words.slice(0, 4).join(" ").trim() || null;
 }
 
-// FIX: adultos/crianças separado (não somar e perder info)
 function parseAdultsChildren(text) {
   const t = normalizeText(text);
 
@@ -470,11 +483,11 @@ function parseAdultsChildren(text) {
 function parsePeopleTotalFallback(text) {
   const t = normalizeText(text);
 
-  // "para 4 pessoas"
+  // "4 pessoas"
   const m2 = t.match(/\b(\d+)\s*(pessoas|pessoa|lugares|lugar)\b/);
   if (m2) return Number(m2[1]);
 
-  // fallback: last number in message (avoiding hour)
+  // fallback: last number (avoid hour)
   const nums = [...t.matchAll(/\b(\d{1,2})\b/g)].map((x) => Number(x[1]));
   if (nums.length) {
     const time = parseTime(text);
@@ -508,9 +521,13 @@ function peopleTotalFromConvData(data) {
 
 function peopleLabelFromConvData(data) {
   if (data?.adultos != null && data?.criancas != null) {
-    return `${data.adultos} adultos e ${data.criancas} criança${Number(data.criancas) === 1 ? "" : "s"}`;
+    const c = Number(data.criancas);
+    return `${data.adultos} adultos e ${data.criancas} criança${c === 1 ? "" : "s"}`;
   }
-  if (data?.pessoasTotal != null) return `${data.pessoasTotal} pessoa${Number(data.pessoasTotal) === 1 ? "" : "s"}`;
+  if (data?.pessoasTotal != null) {
+    const n = Number(data.pessoasTotal);
+    return `${data.pessoasTotal} pessoa${n === 1 ? "" : "s"}`;
+  }
   return "";
 }
 
@@ -561,7 +578,6 @@ async function trelloEnsureList(boardId, listName) {
   const found = await trelloFindListByName(boardId, listName);
   if (found) return found;
 
-  // create list
   return await trelloPost(
     `https://api.trello.com/1/lists?idBoard=${boardId}&name=${encodeURIComponent(listName)}`,
     null
@@ -569,7 +585,7 @@ async function trelloEnsureList(boardId, listName) {
 }
 
 function parsePeopleFromCardName(name) {
-  // expected: "... - N" OR "... - 3ad+1c"
+  // "... - 4" OR "... - 3ad+1c"
   const m = (name || "").match(/-\s*(\d{1,2})\s*$/);
   if (m) return Number(m[1]);
 
@@ -603,7 +619,34 @@ async function getNotionReservaTemplate(name, fallback) {
   return t && t.trim() ? t.trim() : fallback;
 }
 
-function buildConfirmMessage({ nome, dataList, hora, peopleLabel }) {
+// optional: use Notion template "Mensagem para mandar para o cliente da confirmaçao da reserva" if exists
+async function buildConfirmMessageFromNotionOrFallback({ nome, dataList, hora, peopleLabel }) {
+  const tpl =
+    (await notionFindExactByName(
+      NOTION_DB_RESERVAS,
+      "Mensagem para mandar para o cliente da confirmaçao da reserva"
+    )) || "";
+
+  if (tpl.trim()) {
+    // replace the placeholder block heuristically
+    // We keep the vibe and just inject the final RESERVA data.
+    const reservaBlock =
+      `RESERVA:\n\n` +
+      `Nome: ${nome}\n` +
+      `Data: ${dataList}\n` +
+      `N° de pessoas: ${peopleLabel}\n` +
+      `Horário: ${hora}`;
+
+    // If template already contains "RESERVA:" block, replace it; else append.
+    if (/RESERVA:/i.test(tpl)) {
+      // Replace from "RESERVA:" to end OR to next double-newline chunk
+      const replaced = tpl.replace(/RESERVA:\s*[\s\S]*$/i, reservaBlock);
+      return replaced.trim();
+    }
+    return (tpl.trim() + "\n\n" + reservaBlock).trim();
+  }
+
+  // fallback
   return (
     `Perfeito! 😊\n` +
     `Reserva confirmada:\n\n` +
@@ -676,13 +719,13 @@ const server = http.createServer((req, res) => {
             ? existing
             : { mode: "reserva", data: {}, startedAt: Date.now() };
 
-        // Se o bot acabou de sugerir 19:45 e o cliente respondeu "sim/ok/pode"
+        // if we suggested the max hour and user confirmed
         if (conv?.awaitingHoraMaxConfirm && isAffirmative(incomingText)) {
           conv.data.hora = RESERVA_HORA_MAX;
           conv.awaitingHoraMaxConfirm = false;
         }
 
-        // Extract possible fields from this message
+        // Extract fields from this message
         const nome = parseNameSmart(incomingText);
         const dataList = parseDateToListName(incomingText);
         const hora = parseTime(incomingText);
@@ -697,23 +740,25 @@ const server = http.createServer((req, res) => {
         if (ac) {
           conv.data.adultos = ac.adultos;
           conv.data.criancas = ac.criancas;
-          // se antes tinha total, deixa, mas não é mais necessário
           conv.data.pessoasTotal = undefined;
-        } else if (totalFallback != null && conv.data.adultos == null && conv.data.criancas == null) {
-          // só guarda total se ainda não tem detalhe
+        } else if (
+          totalFallback != null &&
+          conv.data.adultos == null &&
+          conv.data.criancas == null
+        ) {
           conv.data.pessoasTotal = totalFallback;
         }
 
         setConv(state, remoteJid, conv);
 
-        // Ask for missing
+        // Missing fields
         const missing = [];
         if (!conv.data.nome) missing.push("Nome");
         if (!conv.data.dataList) missing.push("Data (DD/MM ou DD/MM/AAAA)");
         if (!conv.data.hora) missing.push("Horário (ex.: 19:30)");
 
-        const totalForLimitsNow = peopleTotalFromConvData(conv.data);
-        if (totalForLimitsNow == null) missing.push("N° de pessoas (ex.: 3 adultos e 1 criança)");
+        const totalNow = peopleTotalFromConvData(conv.data);
+        if (totalNow == null) missing.push("N° de pessoas (ex.: 3 adultos e 1 criança)");
 
         if (missing.length) {
           const pedir = await getNotionReservaTemplate(
@@ -734,13 +779,13 @@ const server = http.createServer((req, res) => {
           return;
         }
 
-        // Validate hour (com resposta mais suave)
+        // Validate hour (soft + suggest max)
         if (!isTimeAllowed(conv.data.hora)) {
           const msg = await getNotionReservaTemplate(
             "LIMITE HORARIO de reserva",
             `Posso colocar ${RESERVA_HORA_MAX}?\n\nÉ o limite de horário para reserva.\n\nTem 15min de tolerância. 😊`
           );
-          conv.awaitingHoraMaxConfirm = true; // espera "ok/sim/pode"
+          conv.awaitingHoraMaxConfirm = true;
           setConv(state, remoteJid, conv);
           await evolutionSendText({ remoteJid, text: msg });
           return;
@@ -765,10 +810,10 @@ const server = http.createServer((req, res) => {
 
         const totalForLimits = peopleTotalFromConvData(conv.data);
 
-        // Regra 2p: só conta como 2p se total==2 e (se tiver detalhe) não tem criança
         const isTwoPeople =
           totalForLimits === 2 &&
-          (conv.data.adultos == null || (Number(conv.data.adultos) === 2 && Number(conv.data.criancas) === 0));
+          (conv.data.adultos == null ||
+            (Number(conv.data.adultos) === 2 && Number(conv.data.criancas) === 0));
 
         if (isTwoPeople && counts.twoP >= max2p) {
           await evolutionSendText({
@@ -789,22 +834,22 @@ const server = http.createServer((req, res) => {
           listId: list.id,
           nome: conv.data.nome,
           hora: conv.data.hora,
-          pessoasLabel: pessoasCard, // exemplo: "3ad+1c" ou "4"
+          pessoasLabel: pessoasCard, // e.g. "3ad+1c" or "4"
           telefone,
         });
 
-        // Confirm to customer (com detalhe adultos/crianças quando tiver)
-        const peopleLabel = peopleLabelFromConvData(conv.data) || `${totalForLimits} pessoas`;
+        // Confirm to customer
+        const peopleLabel =
+          peopleLabelFromConvData(conv.data) || `${totalForLimits} pessoas`;
 
-        await evolutionSendText({
-          remoteJid,
-          text: buildConfirmMessage({
-            nome: conv.data.nome,
-            dataList: conv.data.dataList,
-            hora: conv.data.hora,
-            peopleLabel,
-          }),
+        const confirmMsg = await buildConfirmMessageFromNotionOrFallback({
+          nome: conv.data.nome,
+          dataList: conv.data.dataList,
+          hora: conv.data.hora,
+          peopleLabel,
         });
+
+        await evolutionSendText({ remoteJid, text: confirmMsg });
 
         clearConv(state, remoteJid);
         return;
@@ -828,5 +873,6 @@ const server = http.createServer((req, res) => {
     console.error("initial_load_failed", e?.message || e);
   }
 
-  server.listen(3000, () => console.log("Tsunagari bot v2 on :3000"));
+  const PORT = Number(process.env.PORT || 3000);
+  server.listen(PORT, () => console.log("Tsunagari bot v2 on :" + PORT));
 })();
