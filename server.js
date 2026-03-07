@@ -1,59 +1,319 @@
 const http = require("http");
 
-let last = {
-  at: null,
-  method: null,
-  url: null,
-  headers: null,
-  bodyRaw: null,
-  bodyJson: null,
-};
+// ===== ENV =====
+const {
+  // OpenAI
+  OPENAI_API_KEY,
+  OPENAI_MODEL = "gpt-4o-mini",
 
-function sendJson(res, status, obj) {
-  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify(obj, null, 2));
+  // Evolution
+  EVOLUTION_SERVER_URL, // ex: https://evolutionapi.tsunagariauto.online
+  EVOLUTION_APIKEY,
+  EVOLUTION_INSTANCE = "n8n Tsunagari",
+  EVOLUTION_SEND_PATH = "/message/sendText", // ajuste se sua Evolution usar outro
+
+  // Notion
+  NOTION_TOKEN,
+  NOTION_DB_RESTAURANTE = "2bf12169-2df7-806a-82cc-d8c1c3e39202",
+  NOTION_DB_POLITICA = "2b512169-2df7-80f2-ab82-c358e0393ace",
+  NOTION_DB_PRECOS = "2b512169-2df7-8065-84c2-ea856c101a2d",
+  NOTION_DB_PROMOCOES = "2b512169-2df7-8005-b897-d229a7c10f32",
+  NOTION_DB_RESERVAS = "2b412169-2df7-80c8-ab03-fcd7af2b673e",
+  NOTION_DB_REGRAS = "2b512169-2df7-804d-a6ed-f7417e299ef5",
+  // CARDAPIO: coloque aqui o ID quando você confirmar qual é o DB acessível via API
+  NOTION_DB_CARDAPIO = "",
+
+  NOTION_WELCOME_NAME = "Mensagem de boas vindas:",
+} = process.env;
+
+function must(name, val) {
+  if (!val) throw new Error(`Falta ${name} em Environment Variables`);
 }
 
-const server = http.createServer((req, res) => {
-  // Endpoint pra ver o último payload fácil no navegador
-  if (req.method === "GET" && (req.url === "/last" || req.url === "/last/")) {
-    return sendJson(res, 200, last);
+function normalizeText(s) {
+  return (s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function looksLikeGreeting(text) {
+  const t = normalizeText(text);
+  return (
+    t === "oi" ||
+    t === "ola" ||
+    t === "olá" ||
+    t === "oie" ||
+    t === "oiee" ||
+    t === "oieee" ||
+    t.startsWith("oi ") ||
+    t.startsWith("ola ") ||
+    t.startsWith("olá ") ||
+    t === "bom dia" ||
+    t === "boa tarde" ||
+    t === "boa noite"
+  );
+}
+
+async function notionQueryAllRows(dbId, pageSize = 100) {
+  let cursor = undefined;
+  const rows = [];
+  for (let i = 0; i < 20; i++) {
+    const body = { page_size: pageSize };
+    if (cursor) body.start_cursor = cursor;
+
+    const r = await fetch(`https://api.notion.com/v1/databases/${dbId}/query`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${NOTION_TOKEN}`,
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    const j = await r.json();
+    if (!r.ok) throw new Error(`Notion query failed ${r.status}: ${JSON.stringify(j)}`);
+
+    for (const p of j.results || []) {
+      const name = p.properties?.Nome?.title?.map(t => t.plain_text).join("") || "";
+      const text = p.properties?.Texto?.rich_text?.map(t => t.plain_text).join("") || "";
+      rows.push({ name: name.trim(), text: text.trim() });
+    }
+
+    if (!j.has_more) break;
+    cursor = j.next_cursor;
+  }
+  return rows;
+}
+
+async function notionFindExactByName(dbId, name) {
+  const r = await fetch(`https://api.notion.com/v1/databases/${dbId}/query`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${NOTION_TOKEN}`,
+      "Notion-Version": "2022-06-28",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      page_size: 10,
+      filter: { property: "Nome", title: { equals: name } },
+    }),
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error(`Notion query failed ${r.status}: ${JSON.stringify(j)}`);
+
+  const page = j.results?.[0];
+  if (!page) return null;
+  const text = page.properties?.Texto?.rich_text?.map(t => t.plain_text).join("") || "";
+  return text.trim() || null;
+}
+
+function extractIncomingText(bodyJson) {
+  const msg = bodyJson?.data?.message || {};
+  return (
+    msg.conversation ||
+    msg.extendedTextMessage?.text ||
+    msg.imageMessage?.caption ||
+    msg.videoMessage?.caption ||
+    ""
+  ).trim();
+}
+
+async function evolutionSendText({ remoteJid, text }) {
+  const number = (remoteJid || "").split("@")[0];
+  const url =
+    EVOLUTION_SERVER_URL.replace(/\/$/, "") +
+    EVOLUTION_SEND_PATH +
+    "/" +
+    encodeURIComponent(EVOLUTION_INSTANCE);
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: EVOLUTION_APIKEY,
+    },
+    body: JSON.stringify({ number, text }),
+  });
+
+  const body = await r.text();
+  if (!r.ok) throw new Error(`Evolution send failed ${r.status}: ${body}`);
+  return body;
+}
+
+function simpleRetrieve(question, knowledgeRows, k = 10) {
+  const q = normalizeText(question);
+  const qWords = new Set(q.split(" ").filter(w => w.length >= 3));
+  const scored = [];
+
+  for (const row of knowledgeRows) {
+    const hay = normalizeText(row.name + " " + row.text);
+    let score = 0;
+    for (const w of qWords) {
+      if (hay.includes(w)) score++;
+    }
+    if (score > 0) scored.push({ score, row });
   }
 
-  // Healthcheck simples
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, k).map(x => x.row);
+}
+
+async function openaiAnswer({ question, pushName, retrieved }) {
+  const sys = `
+Você é a Liz, assistente do restaurante Tsunagari.
+Regras obrigatórias:
+- Tom sempre carinhoso, educado e calmo, mesmo se o cliente for grosseiro.
+- Não invente preços, promoções, regras ou informações. Se não estiver nas informações fornecidas, peça esclarecimento ou diga que vai confirmar.
+- Seja curta e objetiva (WhatsApp), mas completa.
+- Pode usar emojis leves (🙏😊✨🍣❤️), sem exagero.
+`;
+
+  const context = retrieved
+    .map((r, i) => `[#${i + 1}] ${r.name}\n${r.text}`)
+    .join("\n\n");
+
+  const user = `
+Mensagem do cliente (nome no WhatsApp: ${pushName || "não informado"}):
+${question}
+
+Informações do restaurante (trechos do Notion):
+${context || "(nenhuma informação relevante encontrada)"}
+`;
+
+  const r = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      input: [
+        { role: "system", content: sys.trim() },
+        { role: "user", content: user.trim() },
+      ],
+      // reduz risco de “viajar”
+      temperature: 0.2,
+    }),
+  });
+
+  const j = await r.json();
+  if (!r.ok) throw new Error(`OpenAI failed ${r.status}: ${JSON.stringify(j)}`);
+
+  // responses API: pegue o texto agregado
+  const out = (j.output || []).flatMap(o => o.content || []);
+  const text = out
+    .filter(c => c.type === "output_text")
+    .map(c => c.text)
+    .join("")
+    .trim();
+
+  return text || "Perfeito! 😊 Como posso te ajudar?";
+}
+
+// ===== CACHE de Notion (carrega e atualiza periodicamente) =====
+let KNOWLEDGE = [];
+let lastLoadAt = 0;
+
+async function loadKnowledge() {
+  const dbs = [
+    { name: "restaurante", id: NOTION_DB_RESTAURANTE },
+    { name: "politica", id: NOTION_DB_POLITICA },
+    { name: "precos", id: NOTION_DB_PRECOS },
+    { name: "promocoes", id: NOTION_DB_PROMOCOES },
+    { name: "reservas", id: NOTION_DB_RESERVAS },
+    { name: "regras", id: NOTION_DB_REGRAS },
+  ];
+  if (NOTION_DB_CARDAPIO) dbs.push({ name: "cardapio", id: NOTION_DB_CARDAPIO });
+
+  const all = [];
+  for (const db of dbs) {
+    const rows = await notionQueryAllRows(db.id);
+    for (const r of rows) all.push({ ...r, db: db.name });
+  }
+  KNOWLEDGE = all;
+  lastLoadAt = Date.now();
+  console.log("Knowledge loaded:", KNOWLEDGE.length, "rows");
+}
+
+async function ensureKnowledgeFresh() {
+  const maxAgeMs = 5 * 60 * 1000; // 5 min
+  if (Date.now() - lastLoadAt > maxAgeMs) {
+    await loadKnowledge();
+  }
+}
+
+// ===== HTTP server =====
+const server = http.createServer((req, res) => {
   if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     return res.end("OK");
   }
 
-  let body = [];
-  req.on("data", (c) => body.push(c));
-  req.on("end", () => {
-    const bodyRaw = Buffer.concat(body).toString("utf8");
-    let bodyJson = null;
-    try {
-      bodyJson = JSON.parse(bodyRaw);
-    } catch {}
-
-    last = {
-      at: new Date().toISOString(),
-      method: req.method,
-      url: req.url,
-      headers: req.headers,
-      bodyRaw,
-      bodyJson,
-    };
-
-    console.log("---- INCOMING REQUEST ----");
-    console.log("AT:", last.at);
-    console.log("METHOD:", req.method);
-    console.log("URL:", req.url);
-    console.log("BODY_RAW:", bodyRaw);
-    if (bodyJson) console.log("BODY_JSON:", JSON.stringify(bodyJson, null, 2));
-
+  let buf = [];
+  req.on("data", c => buf.push(c));
+  req.on("end", async () => {
+    // responde rápido pro webhook
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     res.end("OK");
+
+    let bodyJson = null;
+    try {
+      bodyJson = JSON.parse(Buffer.concat(buf).toString("utf8"));
+    } catch {
+      return;
+    }
+
+    try {
+      must("OPENAI_API_KEY", OPENAI_API_KEY);
+      must("NOTION_TOKEN", NOTION_TOKEN);
+      must("EVOLUTION_SERVER_URL", EVOLUTION_SERVER_URL);
+      must("EVOLUTION_APIKEY", EVOLUTION_APIKEY);
+
+      // só reage a mensagens recebidas
+      if (bodyJson.event !== "messages.upsert") return;
+      if (bodyJson?.data?.key?.fromMe) return;
+
+      const remoteJid = bodyJson?.data?.key?.remoteJid;
+      const pushName = bodyJson?.data?.pushName || "";
+      const incomingText = extractIncomingText(bodyJson);
+      if (!remoteJid || !incomingText) return;
+
+      await ensureKnowledgeFresh();
+
+      // 1) boas-vindas “exata”
+      if (looksLikeGreeting(incomingText)) {
+        const welcome =
+          (await notionFindExactByName(NOTION_DB_RESTAURANTE, NOTION_WELCOME_NAME)) ||
+          "Oieeee❤️\nAqui é a Liz! Assistente do Tsunagari.\nConte comigo!";
+        await evolutionSendText({ remoteJid, text: welcome });
+        return;
+      }
+
+      // 2) dúvidas: recuperar trechos relevantes + OpenAI
+      const retrieved = simpleRetrieve(incomingText, KNOWLEDGE, 12);
+      const answer = await openaiAnswer({ question: incomingText, pushName, retrieved });
+      await evolutionSendText({ remoteJid, text: answer });
+
+      console.log("answered", remoteJid, "q:", incomingText);
+    } catch (e) {
+      console.error("handler_error", e?.message || e);
+    }
   });
+});
+
+(async () => {
+  try {
+    await loadKnowledge();
+  } catch (e) {
+    console.error("initial_load_failed", e?.message || e);
+  }
+  server.listen(3000, () => console.log("Tsunagari bot v1 on :3000"));
+})();
 });
 
 server.listen(3000, () => console.log("Webhook collector on :3000"));
