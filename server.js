@@ -230,8 +230,8 @@ async function evolutionSendText({ remoteJid, text }) {
 function simpleRetrieve(question, knowledgeRows, k = 12) {
   const q = normalizeText(question);
   const qWords = new Set(q.split(" ").filter((w) => w.length >= 3));
-
   const scored = [];
+
   for (const row of knowledgeRows) {
     const hay = normalizeText(row.name + " " + row.text);
     let score = 0;
@@ -243,7 +243,7 @@ function simpleRetrieve(question, knowledgeRows, k = 12) {
   return scored.slice(0, k).map((x) => x.row);
 }
 
-// ===== Answer sanitization (same vibe) =====
+// ===== Answer sanitization =====
 function shouldAllowLinks(question) {
   const q = normalizeText(question);
   return (
@@ -282,6 +282,7 @@ function sanitizeAnswer(text, question) {
     /\bate mais\b\.?\s*$/i,
     /\baté mais\b\.?\s*$/i,
   ];
+
   let changed = true;
   while (changed) {
     changed = false;
@@ -292,7 +293,7 @@ function sanitizeAnswer(text, question) {
   }
 
   if (!shouldAllowLinks(question)) {
-    t = stripLinks(t).replace(/\s+\n/g, "\n").trim();
+    t = stripLinks(t).replace(/\s+ /g, " ").trim();
   }
   return t.trim();
 }
@@ -320,20 +321,20 @@ Formato:
 `.trim();
 
   const context = retrieved
-    .map((r, i) => `[#${i + 1}] (${r.db}) ${r.name}\n${r.text}`)
-    .join("\n\n");
+    .map((r, i) => `[#${i + 1}] (${r.db}) ${r.name} ${r.text}`)
+    .join(" ");
 
   const user = `
-Pergunta do cliente:
-${question}
-
-Trechos do Notion:
-${context || "(nenhuma informação relevante encontrada)"}
+Pergunta do cliente: ${question}
+Trechos do Notion: ${context || "(nenhuma informação relevante encontrada)"}
 `.trim();
 
   const r = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
     body: JSON.stringify({
       model: OPENAI_MODEL,
       input: [
@@ -362,16 +363,18 @@ function parseDateToListName(text) {
   // accepts dd/mm, dd/mm/yy, dd/mm/yyyy
   const m = text.match(/\b([0-3]?\d)\/([01]?\d)(?:\/(\d{2}|\d{4}))?\b/);
   if (!m) return null;
+
   let dd = m[1].padStart(2, "0");
   let mm = m[2].padStart(2, "0");
   let yy = m[3];
+
   if (!yy) {
-    // if no year, assume current year (2-digit)
     const now = new Date();
     yy = String(now.getFullYear()).slice(-2);
   } else if (yy.length === 4) {
     yy = yy.slice(-2);
   }
+
   return `${dd}/${mm}/${yy}`;
 }
 
@@ -408,13 +411,66 @@ function parsePeople(text) {
   return null;
 }
 
+// FIX 1: parse "Nome: Bernardo Oliveira" (pega a linha inteira)
 function parseName(text) {
-  // Accept "Nome: X" or "No nome de X"
+  // "Nome: Bernardo Oliveira"
   const m = text.match(/nome\s*[:\-]\s*([^\n\r]+)/i);
   if (m) return m[1].trim();
+
+  // "no nome de Bernardo Oliveira"
   const m2 = text.match(/no nome de\s+([^\n\r]+)/i);
   if (m2) return m2[1].trim();
+
   return null;
+}
+
+// FIX 2: quando o cliente manda tudo junto (nome + data + hora + pessoas), inferir nome
+function parseNameSmart(text) {
+  // 1) Se já tem Nome: ..., usa isso
+  const explicit = parseName(text);
+  if (explicit) return explicit;
+
+  const hasDate = /\b([0-3]?\d)\/([01]?\d)(?:\/(\d{2}|\d{4}))?\b/.test(text);
+  const hasTime = /\b([01]?\d|2[0-3])[:h]([0-5]\d)\b/.test(text);
+
+  if (!hasDate && !hasTime) return null;
+
+  // pega o começo da mensagem até antes da data ou da hora
+  const idxDate = text.search(/\b([0-3]?\d)\/([01]?\d)(?:\/(\d{2}|\d{4}))?\b/);
+  const idxTime = text.search(/\b([01]?\d|2[0-3])[:h]([0-5]\d)\b/);
+
+  let cut = -1;
+  if (idxDate >= 0 && idxTime >= 0) cut = Math.min(idxDate, idxTime);
+  else cut = Math.max(idxDate, idxTime);
+
+  if (cut <= 0) return null;
+
+  let candidate = text.slice(0, cut).trim();
+
+  // limpar pontuação comum no começo/fim
+  candidate = candidate.replace(/^[\-\s:–—]+/, "").replace(/[\-\s:–—]+$/, "").trim();
+
+  // se a pessoa colocou "3 adultos..." antes da data (raro), remove números no começo
+  candidate = candidate.replace(/^\d+\s+/, "").trim();
+
+  // limitar tamanho (nome)
+  const words = candidate.split(/\s+/).filter(Boolean);
+  if (words.length < 1) return null;
+
+  // evita pegar "Reserva" / "Quero reservar" como nome
+  const badStarters = new Set([
+    "reserva",
+    "reservar",
+    "quero",
+    "mesa",
+    "agendar",
+    "marcar",
+  ]);
+  if (words.length === 1 && badStarters.has(normalizeText(words[0]))) return null;
+
+  // se vier muito grande, corta para 4 palavras
+  const cleaned = words.slice(0, 4).join(" ").trim();
+  return cleaned || null;
 }
 
 function timeToMinutes(hhmm) {
@@ -431,6 +487,7 @@ async function trelloGet(url) {
   const full = new URL(url);
   full.searchParams.set("key", TRELLO_KEY);
   full.searchParams.set("token", TRELLO_TOKEN);
+
   const r = await fetch(full.toString());
   const t = await r.text();
   if (!r.ok) throw new Error(`Trello GET failed ${r.status}: ${t}`);
@@ -441,26 +498,34 @@ async function trelloPost(url, bodyObj) {
   const full = new URL(url);
   full.searchParams.set("key", TRELLO_KEY);
   full.searchParams.set("token", TRELLO_TOKEN);
+
   const r = await fetch(full.toString(), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: bodyObj ? JSON.stringify(bodyObj) : undefined,
   });
+
   const t = await r.text();
   if (!r.ok) throw new Error(`Trello POST failed ${r.status}: ${t}`);
   return JSON.parse(t);
 }
 
 async function trelloFindListByName(boardId, listName) {
-  const lists = await trelloGet(`https://api.trello.com/1/boards/${boardId}/lists?fields=name,closed&limit=1000`);
+  const lists = await trelloGet(
+    `https://api.trello.com/1/boards/${boardId}/lists?fields=name,closed&limit=1000`
+  );
   return (lists || []).find((l) => !l.closed && l.name === listName) || null;
 }
 
 async function trelloEnsureList(boardId, listName) {
   const found = await trelloFindListByName(boardId, listName);
   if (found) return found;
+
   // create list
-  return await trelloPost(`https://api.trello.com/1/lists?idBoard=${boardId}&name=${encodeURIComponent(listName)}`, null);
+  return await trelloPost(
+    `https://api.trello.com/1/lists?idBoard=${boardId}&name=${encodeURIComponent(listName)}`,
+    null
+  );
 }
 
 function parsePeopleFromCardName(name) {
@@ -471,7 +536,9 @@ function parsePeopleFromCardName(name) {
 }
 
 async function trelloCountList(listId) {
-  const cards = await trelloGet(`https://api.trello.com/1/lists/${listId}/cards?fields=name&limit=1000`);
+  const cards = await trelloGet(
+    `https://api.trello.com/1/lists/${listId}/cards?fields=name&limit=1000`
+  );
   const total = cards.length;
   const twoP = cards.filter((c) => parsePeopleFromCardName(c.name) === 2).length;
   return { total, twoP };
@@ -489,18 +556,17 @@ async function trelloCreateReservaCard({ listId, nome, hora, pessoas, telefone }
 // ===== Reserva messages =====
 async function getNotionReservaTemplate(name, fallback) {
   const t = await notionFindExactByName(NOTION_DB_RESERVAS, name);
-  return (t && t.trim()) ? t.trim() : fallback;
+  return t && t.trim() ? t.trim() : fallback;
 }
 
 function buildConfirmMessage({ nome, dataList, hora, pessoas }) {
-  // dataList is DD/MM/YY; message uses same (OK)
   return (
-    `Perfeito! 😊\n` +
+    `Perfeito! 😊 ` +
     `Reserva confirmada:\n` +
     `Nome: ${nome}\n` +
     `Data: ${dataList}\n` +
     `Horário: ${hora}\n` +
-    `Pessoas: ${pessoas}\n\n` +
+    `Pessoas: ${pessoas}\n` +
     `⏰ Tolerância de 15min. Após esse período, a mesa pode ser liberada pra quem estiver aguardando.\n` +
     `Se precisar alterar ou cancelar, é só avisar! 🍣✨`
   );
@@ -545,30 +611,29 @@ const server = http.createServer((req, res) => {
       if (!remoteJid || !incomingText) return;
 
       const state = loadState();
-
       await ensureKnowledgeFresh();
 
       // 1) greeting => exact welcome from Notion
       if (looksLikeGreeting(incomingText)) {
         const welcome =
           (await notionFindExactByName(NOTION_DB_RESTAURANTE, NOTION_WELCOME_NAME)) ||
-          "Oieeee❤️\nAqui é a Liz! Assistente do Tsunagari.\nConte comigo!";
+          "Oieeee❤️ Aqui é a Liz! Assistente do Tsunagari. Conte comigo!";
         await evolutionSendText({ remoteJid, text: welcome });
         return;
       }
 
-      // 2) If in reservation flow, try to fill fields
+      // 2) Reserva flow
       const existing = getConv(state, remoteJid);
       const inReservaFlow = existing?.mode === "reserva";
 
-      // 2a) Start reservation flow if intent detected (or already in it)
       if (looksLikeReservaIntent(incomingText) || inReservaFlow) {
-        const conv = existing && inReservaFlow
-          ? existing
-          : { mode: "reserva", data: {}, startedAt: Date.now() };
+        const conv =
+          existing && inReservaFlow
+            ? existing
+            : { mode: "reserva", data: {}, startedAt: Date.now() };
 
         // Extract possible fields from this message
-        const nome = parseName(incomingText);
+        const nome = parseNameSmart(incomingText);
         const dataList = parseDateToListName(incomingText);
         const hora = parseTime(incomingText);
         const pessoas = parsePeople(incomingText);
@@ -590,10 +655,9 @@ const server = http.createServer((req, res) => {
         if (missing.length) {
           const pedir = await getNotionReservaTemplate(
             "dados para a reserva",
-            "Perfeito! 😊 Pra eu agendar sua reserva, me manda:\n\nNome:\nData:\nHorário:\nQuantidade de pessoas:"
+            "Perfeito! 😊 Pra eu agendar sua reserva, me manda:\nNome:\nData:\nHorário:\nQuantidade de pessoas:"
           );
 
-          // If already started, just remind missing (short)
           if (inReservaFlow) {
             await evolutionSendText({
               remoteJid,
@@ -621,7 +685,6 @@ const server = http.createServer((req, res) => {
         // Trello capacity check
         const list = await trelloEnsureList(TRELLO_BOARD_ID, conv.data.dataList);
         const counts = await trelloCountList(list.id);
-
         const maxTotal = Number(RESERVA_MAX_TOTAL_DIA);
         const max2p = Number(RESERVA_MAX_2P_DIA);
 
@@ -688,5 +751,6 @@ const server = http.createServer((req, res) => {
   } catch (e) {
     console.error("initial_load_failed", e?.message || e);
   }
+
   server.listen(3000, () => console.log("Tsunagari bot v2 on :3000"));
 })();
