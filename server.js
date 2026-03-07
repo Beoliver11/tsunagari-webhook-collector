@@ -635,7 +635,17 @@ const server = http.createServer((req, res) => {
         const nome = parseNameSmart(incomingText);
         const dataList = parseDateToListName(incomingText);
         const hora = parseTime(incomingText);
-        const pessoas = parsePeople(incomingText);
+        const ac = parseAdultsChildren(incomingText);
+if (ac) {
+  // só atualiza se vier algo explícito
+  if (ac.adultos !== null) conv.data.adultos = ac.adultos;
+  if (ac.criancas !== null) conv.data.criancas = ac.criancas;
+} else {
+  // fallback: "4 pessoas"
+  const total = parsePeopleTotalFallback(incomingText);
+  if (total) conv.data.pessoasTotal = total;
+}
+
 
         if (nome) conv.data.nome = nome;
         if (dataList) conv.data.dataList = dataList;
