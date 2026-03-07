@@ -1,35 +1,19 @@
 /**
  * Tsunagari WhatsApp Bot (Evolution + Notion + Trello + OpenAI) — “produção”
  *
- * Inclui (tudo que combinamos):
- * - Handoff automático: se alguém do restaurante enviar msg (fromMe=true), bot pausa a conversa por HANDOFF_MINUTES
- * - Dedupe: ignora mensagem repetida (mesmo messageId) por remoteJid
- * - Throttle: evita “metralhar” respostas (cooldown por conversa)
- * - Reserva: pede dados, valida domingo fechado, valida data passada, valida hora limite (sugere RESERVA_HORA_MAX),
- *           adultos/crianças separado, cria card no Trello, confirma usando template do Notion se existir
- * - Hard rules: “tem pizza/hambúrguer?” => resposta fixa
- * - Pedido (order intent): avisa ADMIN + responde cliente
- * - Alertas de erro: se Trello/Notion/OpenAI falhar, avisa ADMIN com contexto
- * - Links: sem markdown; só envia link se cliente pedir
- * - PORT: usa process.env.PORT (EasyPanel)
- *
- * ENV obrigatórias:
- * - OPENAI_API_KEY
- * - NOTION_TOKEN
- * - EVOLUTION_SERVER_URL, EVOLUTION_APIKEY, EVOLUTION_INSTANCE
- * - TRELLO_KEY, TRELLO_TOKEN, TRELLO_BOARD_ID
- *
- * ENV recomendadas:
- * - PORT
- * - ADMIN_WHATSAPP=5561999211921
- * - HANDOFF_MINUTES=180
- * - COOLDOWN_MS=1200
- * - DEDUPE_TTL_MS=600000
- * - FECHADO_DOMINGO=1
- * - MAX_ADVANCE_DAYS=120
- * - RESERVA_HORA_MAX=19:45
- * - RESERVA_MAX_TOTAL_DIA=13
- * - RESERVA_MAX_2P_DIA=4
+ * O que este arquivo já resolve:
+ * - Handoff automático: fromMe=true pausa a conversa por HANDOFF_MINUTES
+ * - Dedupe: ignora messageId repetido (se vier no payload)
+ * - Throttle: cooldown por conversa
+ * - Reserva: pede dados, domingo fechado, data passada, data muito distante, hora limite com sugestão (19:45)
+ * - Pessoas: mantém adultos/crianças (não soma e perde)
+ * - Nome: pega nome completo (Nome: ...) + pega nome “solto” quando a conversa está em modo reserva
+ * - Falso positivo de reserva: "amanhã/hoje" sozinho NÃO inicia reserva
+ * - Anti-spam: não repete a mesma lista de “faltando” a cada mensagem
+ * - Pedidos: detecta pedido e avisa ADMIN_WHATSAPP
+ * - Alertas de erro: manda erro pro admin
+ * - Links: sem markdown; só manda link se cliente pedir
+ * - PORT via process.env.PORT (EasyPanel)
  */
 
 const http = require("http");
@@ -53,8 +37,11 @@ const {
 
   // Production knobs
   HANDOFF_MINUTES = "180",
-  COOLDOWN_MS = "1200",
+  COOLDOWN_MS = "1500",
   DEDUPE_TTL_MS = "600000",
+
+  // anti-spam do “faltando”
+  MISSING_REPEAT_SUPPRESS_MS = "60000", // 60s
 
   // Notion
   NOTION_TOKEN,
@@ -102,11 +89,17 @@ function normalizeText(s) {
     .trim();
 }
 
+// saudação robusta: "Olá," "Olá!" "Oi..."
 function looksLikeGreeting(text) {
   const t = normalizeText(text);
   return /^(oi|ola|oie+|bom dia|boa tarde|boa noite)\b/.test(t);
 }
 
+/**
+ * FIX IMPORTANTE: Intent de reserva MAIS RÍGIDO
+ * - NÃO usa “pra amanhã/pra hoje” como gatilho sozinho
+ * - só entra em reserva se tiver termos claros (reserva/mesa/agendar/marcar)
+ */
 function looksLikeReservaIntent(text) {
   const t = normalizeText(text);
   return (
@@ -115,11 +108,7 @@ function looksLikeReservaIntent(text) {
     t.includes("quero reservar") ||
     t.includes("mesa") ||
     t.includes("agendar") ||
-    t.includes("marcar") ||
-    t.includes("pra hoje") ||
-    t.includes("para hoje") ||
-    t.includes("pra amanha") ||
-    t.includes("para amanha")
+    t.includes("marcar")
   );
 }
 
@@ -153,13 +142,7 @@ function extractIncomingText(bodyJson) {
 }
 
 function getIncomingMessageId(bodyJson) {
-  // Evolution/baileys geralmente tem isso
-  return (
-    bodyJson?.data?.key?.id ||
-    bodyJson?.data?.messageId ||
-    bodyJson?.data?.id ||
-    ""
-  );
+  return bodyJson?.data?.key?.id || bodyJson?.data?.messageId || bodyJson?.data?.id || "";
 }
 
 // ======== Persistent state (file) ========
@@ -210,11 +193,10 @@ function markBotReplied(state, remoteJid) {
 }
 
 function isDuplicateAndMark(state, remoteJid, msgId) {
-  if (!msgId) return false; // sem id, não dá pra dedupe
+  if (!msgId) return false;
   const ttl = Math.max(60_000, Number(DEDUPE_TTL_MS || 600_000));
   const c = getConv(state, remoteJid) || { mode: null, data: {} };
 
-  // limpeza simples
   if (!c.seen) c.seen = {};
   for (const [id, ts] of Object.entries(c.seen)) {
     if (Date.now() - Number(ts || 0) > ttl) delete c.seen[id];
@@ -254,7 +236,10 @@ async function notionQueryAllRows(dbId, pageSize = 100) {
     for (const p of j.results || []) {
       const name = p.properties?.Nome?.title?.map((t) => t.plain_text).join("") || "";
       const text = p.properties?.Texto?.rich_text?.map((t) => t.plain_text).join("") || "";
-      rows.push({ name: name.trim(), text: text.trim() });
+      const nm = name.trim();
+      const tx = text.trim();
+      if (!nm && !tx) continue; // ignora vazio
+      rows.push({ name: nm, text: tx });
     }
 
     if (!j.has_more) break;
@@ -305,10 +290,7 @@ async function loadKnowledge() {
   const all = [];
   for (const db of dbs) {
     const rows = await notionQueryAllRows(db.id);
-    for (const r of rows) {
-      if (!r.name && !r.text) continue; // ignora vazio
-      all.push({ ...r, db: db.name });
-    }
+    for (const r of rows) all.push({ ...r, db: db.name });
   }
 
   KNOWLEDGE = all;
@@ -570,6 +552,7 @@ function parseName(text) {
   return null;
 }
 
+// infer name only when message contains date/time later
 function parseNameSmart(text) {
   const explicit = parseName(text);
   if (explicit) return explicit;
@@ -598,6 +581,32 @@ function parseNameSmart(text) {
   if (words.length === 1 && bad.has(normalizeText(words[0]))) return null;
 
   return words.slice(0, 4).join(" ").trim() || null;
+}
+
+/**
+ * FIX: no fluxo de reserva, se ainda falta nome e a pessoa mandar só "Nome Sobrenome",
+ * a gente aceita como nome (mesmo sem data/hora na mesma msg).
+ */
+function looksLikeStandaloneName(text) {
+  const raw = (text || "").trim();
+  if (!raw) return false;
+  if (/\d/.test(raw)) return false; // não pode ter número
+  if (raw.length < 4 || raw.length > 60) return false;
+
+  const t = normalizeText(raw);
+  // não aceitar frases comuns
+  if (
+    /\b(reserva|reservar|mesa|amanha|hoje|horario|horário|pessoas|adultos|criancas|crianças)\b/.test(t)
+  )
+    return false;
+
+  const words = raw.split(/\s+/).filter(Boolean);
+  if (words.length < 2 || words.length > 4) return false;
+
+  // precisa ser basicamente letras/pontos/hífen
+  if (!/^[A-Za-zÀ-ÿ'.-]+(\s+[A-Za-zÀ-ÿ'.-]+)+$/.test(raw)) return false;
+
+  return true;
 }
 
 function parseAdultsChildren(text) {
@@ -784,7 +793,28 @@ async function buildConfirmMessageFromNotionOrFallback({ nome, dataList, hora, p
   );
 }
 
-// ===== Main handler =====
+// ===== Anti-spam do “missing” =====
+function missingSignature(missingArr) {
+  return (missingArr || []).join("|");
+}
+
+function shouldSuppressMissingRepeat(conv, missingArr) {
+  const sig = missingSignature(missingArr);
+  const suppressMs = Math.max(5_000, Number(MISSING_REPEAT_SUPPRESS_MS || 60_000));
+  const lastSig = conv?.lastMissingSig || "";
+  const lastAt = Number(conv?.lastMissingAskedAt || 0);
+
+  if (sig === lastSig && Date.now() - lastAt < suppressMs) return true;
+  return false;
+}
+
+function markMissingAsked(state, remoteJid, conv, missingArr) {
+  conv.lastMissingSig = missingSignature(missingArr);
+  conv.lastMissingAskedAt = Date.now();
+  setConv(state, remoteJid, conv);
+}
+
+// ===== Main webhook =====
 async function handleWebhook(bodyJson) {
   must("OPENAI_API_KEY", OPENAI_API_KEY);
   must("NOTION_TOKEN", NOTION_TOKEN);
@@ -802,7 +832,7 @@ async function handleWebhook(bodyJson) {
 
   const msgId = getIncomingMessageId(bodyJson);
 
-  // HANDOFF: se humano enviou msg (fromMe=true), pausa conversa e sai
+  // HANDOFF: humano falou
   if (bodyJson?.data?.key?.fromMe) {
     const state = loadState();
     const mins = Math.max(5, Number(HANDOFF_MINUTES || 180));
@@ -824,20 +854,12 @@ async function handleWebhook(bodyJson) {
 
   // paused?
   const pause = getConv(state, remoteJid);
-  if (pause?.handoffUntil && pause.handoffUntil > Date.now()) {
-    console.log(`[${nowIso()}] paused jid=${remoteJid} until=${new Date(pause.handoffUntil).toISOString()}`);
-    return;
-  }
+  if (pause?.handoffUntil && pause.handoffUntil > Date.now()) return;
 
-  // throttle (avoid blasting)
-  if (shouldThrottle(pause)) {
-    console.log(`[${nowIso()}] throttled jid=${remoteJid}`);
-    return;
-  }
+  // throttle
+  if (shouldThrottle(pause)) return;
 
   await ensureKnowledgeFresh();
-
-  console.log(`[${nowIso()}] inbound jid=${remoteJid} id=${msgId} text="${incomingText.slice(0, 200)}"`);
 
   // Greeting
   if (looksLikeGreeting(incomingText)) {
@@ -881,46 +903,45 @@ async function handleWebhook(bodyJson) {
   // Reserva flow
   if (looksLikeReservaIntent(incomingText) || inReservaFlow) {
     const conv =
-      existing && inReservaFlow
-        ? existing
-        : { mode: "reserva", data: {}, startedAt: Date.now() };
+      existing && inReservaFlow ? existing : { mode: "reserva", data: {}, startedAt: Date.now() };
 
-    // if suggested max hour and user confirmed
+    // confirmar hora max
     if (conv?.awaitingHoraMaxConfirm && isAffirmative(incomingText)) {
       conv.data.hora = RESERVA_HORA_MAX;
       conv.awaitingHoraMaxConfirm = false;
     }
 
-    // parse date object (for validations)
+    // parse date object
     const dateObjNow = parseDateBR(incomingText);
     if (dateObjNow) conv.data.dateObj = dateObjNow;
 
     // fields
-    const nome = parseNameSmart(incomingText);
+    const nomeSmart = parseNameSmart(incomingText);
     const dataList = parseDateToListName(incomingText);
     const hora = parseTime(incomingText);
     const ac = parseAdultsChildren(incomingText);
     const totalFallback = parsePeopleTotalFallback(incomingText);
 
-    if (nome) conv.data.nome = nome;
+    if (nomeSmart) conv.data.nome = nomeSmart;
     if (dataList) conv.data.dataList = dataList;
     if (hora) conv.data.hora = hora;
+
+    // FIX: nome “solto” dentro do fluxo de reserva
+    if (!conv.data.nome && looksLikeStandaloneName(incomingText)) {
+      conv.data.nome = incomingText.trim();
+    }
 
     if (ac) {
       conv.data.adultos = ac.adultos;
       conv.data.criancas = ac.criancas;
       conv.data.pessoasTotal = undefined;
-    } else if (
-      totalFallback != null &&
-      conv.data.adultos == null &&
-      conv.data.criancas == null
-    ) {
+    } else if (totalFallback != null && conv.data.adultos == null && conv.data.criancas == null) {
       conv.data.pessoasTotal = totalFallback;
     }
 
     setConv(state, remoteJid, conv);
 
-    // Date validations if have date
+    // date validations
     if (conv.data.dateObj) {
       if (FECHADO_DOMINGO !== "0" && isSundayBR(conv.data.dateObj)) {
         await evolutionSendText({
@@ -938,7 +959,6 @@ async function handleWebhook(bodyJson) {
           remoteJid,
           text: "Essa data já passou 🙂 Consegue me confirmar a data da reserva (DD/MM)?",
         });
-        // mantém o fluxo, só não cria card
         markBotReplied(state, remoteJid);
         return;
       }
@@ -955,7 +975,7 @@ async function handleWebhook(bodyJson) {
       }
     }
 
-    // Missing fields
+    // missing
     const missing = [];
     if (!conv.data.nome) missing.push("Nome");
     if (!conv.data.dataList) missing.push("Data (DD/MM ou DD/MM/AAAA)");
@@ -964,6 +984,11 @@ async function handleWebhook(bodyJson) {
     if (totalNow == null) missing.push("N° de pessoas (ex.: 3 adultos e 1 criança)");
 
     if (missing.length) {
+      // FIX: não ficar repetindo a MESMA lista de faltantes
+      if (shouldSuppressMissingRepeat(conv, missing)) {
+        return; // fica quieto (evita spam)
+      }
+
       const pedir = await getNotionReservaTemplate(
         "dados para a reserva",
         "Para agendar sua reserva precisamos destes dados:\n\nNome:\nData:\nN° de pessoas: X adultos e X crianças\nHorário:\n\nAssim que mandar agendamos sua reserva!"
@@ -980,11 +1005,12 @@ async function handleWebhook(bodyJson) {
         await evolutionSendText({ remoteJid, text: pedir });
       }
 
+      markMissingAsked(state, remoteJid, conv, missing);
       markBotReplied(state, remoteJid);
       return;
     }
 
-    // Hour limit
+    // hour limit
     if (!isTimeAllowed(conv.data.hora)) {
       const msg = await getNotionReservaTemplate(
         "LIMITE HORARIO de reserva",
@@ -997,7 +1023,7 @@ async function handleWebhook(bodyJson) {
       return;
     }
 
-    // Capacity / Trello
+    // Trello capacity
     const list = await trelloEnsureList(TRELLO_BOARD_ID, conv.data.dataList);
     const counts = await trelloCountList(list.id);
 
@@ -1024,7 +1050,8 @@ async function handleWebhook(bodyJson) {
     if (isTwoPeople && counts.twoP >= max2p) {
       await evolutionSendText({
         remoteJid,
-        text: "Hoje já atingimos o limite de reservas para 2 pessoas. 😊\nMas você pode vir sem reserva por ordem de chegada. 🍣✨",
+        text:
+          "Hoje já atingimos o limite de reservas para 2 pessoas. 😊\nMas você pode vir sem reserva por ordem de chegada. 🍣✨",
       });
       clearConv(state, remoteJid);
       markBotReplied(state, remoteJid);
@@ -1044,9 +1071,7 @@ async function handleWebhook(bodyJson) {
     });
 
     // Confirm
-    const peopleLabel =
-      peopleLabelFromConvData(conv.data) || `${totalForLimits} pessoas`;
-
+    const peopleLabel = peopleLabelFromConvData(conv.data) || `${totalForLimits} pessoas`;
     const confirmMsg = await buildConfirmMessageFromNotionOrFallback({
       nome: conv.data.nome,
       dataList: conv.data.dataList,
@@ -1057,8 +1082,6 @@ async function handleWebhook(bodyJson) {
     await evolutionSendText({ remoteJid, text: confirmMsg });
     clearConv(state, remoteJid);
     markBotReplied(state, remoteJid);
-
-    console.log(`[${nowIso()}] reserva_confirmed jid=${remoteJid} list=${conv.data.dataList} card="${conv.data.nome} - ${conv.data.hora} - ${pessoasCard}"`);
     return;
   }
 
@@ -1097,7 +1120,7 @@ const server = http.createServer((req, res) => {
       const msg = e?.message || String(e);
       console.error(`[${nowIso()}] handler_error`, msg);
 
-      // tenta alertar admin com contexto mínimo (sem vazar tokens)
+      // alerta admin
       try {
         const remoteJid = bodyJson?.data?.key?.remoteJid || "";
         const incomingText = extractIncomingText(bodyJson);
