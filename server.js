@@ -275,6 +275,10 @@ function stripLinks(text) {
   return t;
 }
 
+function unmarkdownLinks(t) {
+  return (t || "").replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/gi, "$2");
+}
+
 function sanitizeAnswer(text, question) {
   let t = (text || "").trim();
 
@@ -282,6 +286,13 @@ function sanitizeAnswer(text, question) {
   t = t.replace(
     /^(oi|ol[aá]|oie+)\s*[!,.:;\-–—]*\s*(?:[A-Za-zÀ-ÿ0-9_.-]{2,30})?\s*[!,.:;\-–—]*\s*/i,
     ""
+
+if (shouldAllowLinks(question)) {
+  t = unmarkdownLinks(t);
+} else {
+  t = stripLinks(t);
+}
+    
   );
 
   // remove “despedidas”
