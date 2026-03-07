@@ -373,21 +373,32 @@ function parseTime(text) {
   return `${m[1].padStart(2, "0")}:${m[2]}`;
 }
 
-function parsePeople(text) {
+function parseAdultsChildren(text) {
   const t = normalizeText(text);
 
-  // pattern: "X adultos e Y criancas"
+  // "3 adultos e 1 criança"
   const m = t.match(/\b(\d+)\s*adult[oa]s?\b.*?\b(\d+)\s*crianc[ao]s?\b/);
-  if (m) return Number(m[1]) + Number(m[2]);
+  if (m) return { adultos: Number(m[1]), criancas: Number(m[2]) };
 
-  // pattern: "para N pessoas"
+  // "3 adultos" (sem criança)
+  const mA = t.match(/\b(\d+)\s*adult[oa]s?\b/);
+  if (mA) return { adultos: Number(mA[1]), criancas: 0 };
+
+  // "1 criança" (sem adulto)
+  const mC = t.match(/\b(\d+)\s*crianc[ao]s?\b/);
+  if (mC) return { adultos: 0, criancas: Number(mC[1]) };
+
+  return null;
+}
+
+function parsePeopleTotalFallback(text) {
+  const t = normalizeText(text);
+
   const m2 = t.match(/\b(\d+)\s*(pessoas|pessoa|lugares|lugar)\b/);
   if (m2) return Number(m2[1]);
 
-  // pattern: last number in message (fallback)
   const nums = [...t.matchAll(/\b(\d{1,2})\b/g)].map((x) => Number(x[1]));
   if (nums.length) {
-    // avoid using time hour as people: if time exists, ignore hour
     const time = parseTime(text);
     if (time) {
       const hour = Number(time.split(":")[0]);
@@ -396,7 +407,6 @@ function parsePeople(text) {
     }
     return nums[nums.length - 1];
   }
-
   return null;
 }
 
