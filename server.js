@@ -1,13 +1,13 @@
 /**
  * Tsunagari WhatsApp Bot (v1)
- * - Webhook: recebe Evolution API event=messages.upsert
- * - "Oi/Olá" => responde com a mensagem EXATA do Notion (Mensagem de boas vindas:)
- * - Outras dúvidas => recupera trechos do Notion + OpenAI (sem inventar)
+ * - Webhook: Evolution API event=messages.upsert
+ * - Saudação ("oi/olá...") => responde com texto EXATO do Notion
+ * - Outras dúvidas => Notion (trechos) + OpenAI, sem inventar
  *
- * Ajustes:
- * - NÃO usa nome do cliente
- * - NÃO inicia respostas com "Olá/Oi" (exceto boas-vindas)
- * - NÃO encerra com despedidas ("aproveite seu dia" etc.)
+ * Ajustes obrigatórios:
+ * - NÃO usar nome do cliente
+ * - NÃO começar com "Olá/Oi"
+ * - NÃO encerrar com "abraços", "até mais", "aproveite o dia", "é só avisar" etc.
  */
 
 const http = require("http");
@@ -19,10 +19,10 @@ const {
   OPENAI_MODEL = "gpt-4o-mini",
 
   // Evolution
-  EVOLUTION_SERVER_URL, // ex: https://evolutionapi.tsunagariauto.online
+  EVOLUTION_SERVER_URL,
   EVOLUTION_APIKEY,
   EVOLUTION_INSTANCE = "n8n Tsunagari",
-  EVOLUTION_SEND_PATH = "/message/sendText", // ajuste se necessário
+  EVOLUTION_SEND_PATH = "/message/sendText",
 
   // Notion
   NOTION_TOKEN,
@@ -34,7 +34,6 @@ const {
   NOTION_DB_PROMOCOES = "2b512169-2df7-8005-b897-d229a7c10f32",
   NOTION_DB_RESERVAS = "2b412169-2df7-80c8-ab03-fcd7af2b673e",
   NOTION_DB_REGRAS = "2b512169-2df7-804d-a6ed-f7417e299ef5",
-  // Cardápio (se tiver ID acessível via API, coloque)
   NOTION_DB_CARDAPIO = "",
 } = process.env;
 
@@ -167,9 +166,7 @@ async function loadKnowledge() {
 
 async function ensureKnowledgeFresh() {
   const maxAgeMs = 5 * 60 * 1000; // 5 min
-  if (Date.now() - lastLoadAt > maxAgeMs) {
-    await loadKnowledge();
-  }
+  if (Date.now() - lastLoadAt > maxAgeMs) await loadKnowledge();
 }
 
 // ===== Evolution send =====
@@ -183,10 +180,7 @@ async function evolutionSendText({ remoteJid, text }) {
 
   const r = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      apikey: EVOLUTION_APIKEY,
-    },
+    headers: { "Content-Type": "application/json", apikey: EVOLUTION_APIKEY },
     body: JSON.stringify({ number, text }),
   });
 
@@ -204,9 +198,7 @@ function simpleRetrieve(question, knowledgeRows, k = 12) {
   for (const row of knowledgeRows) {
     const hay = normalizeText(row.name + " " + row.text);
     let score = 0;
-    for (const w of qWords) {
-      if (hay.includes(w)) score++;
-    }
+    for (const w of qWords) if (hay.includes(w)) score++;
     if (score > 0) scored.push({ score, row });
   }
 
@@ -214,23 +206,63 @@ function simpleRetrieve(question, knowledgeRows, k = 12) {
   return scored.slice(0, k).map((x) => x.row);
 }
 
+// ===== Output sanitizer (remove greeting+name, remove closings) =====
+function sanitizeAnswer(text) {
+  let t = (text || "").trim();
+
+  // Remove leading greeting + optional name: "Olá, Bê" / "Oi Maria" / "Oiee, fulano"
+  t = t.replace(
+    /^(oi|ol[aá]|oie+)\s*[!,.:;\-–—]*\s*(?:[A-Za-zÀ-ÿ0-9_.-]{2,30})?\s*[!,.:;\-–—]*\s*/i,
+    ""
+  );
+
+  // Remove common closings at end (and repeated)
+  const closingPatterns = [
+    /\babracos\b\.?\s*$/i,
+    /\babraços\b\.?\s*$/i,
+    /\baproveite( o)? seu dia\b\.?\s*$/i,
+    /\btenha um (otimo|ótimo) dia\b\.?\s*$/i,
+    /\bate mais\b\.?\s*$/i,
+    /\baté mais\b\.?\s*$/i,
+    /\bqualquer coisa\b\.?\s*$/i,
+    /\bqualquer dúvida\b\.?\s*$/i,
+    /\bé so avisar\b\.?\s*$/i,
+    /\bé só avisar\b\.?\s*$/i,
+  ];
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const before = t;
+    for (const re of closingPatterns) t = t.replace(re, "");
+    t = t.trim();
+    if (t !== before) changed = true;
+  }
+
+  // Keep it open but not "goodbye"
+  if (!/[?]\s*$/.test(t)) {
+    t = (t + "\n\nSe quiser, posso te ajudar com mais alguma coisa 😊").trim();
+  }
+
+  return t.trim();
+}
+
 // ===== OpenAI (Responses API) =====
 async function openaiAnswer({ question, retrieved }) {
   const sys = `
 Você é a Liz, assistente do restaurante Tsunagari (WhatsApp).
 
-Regras obrigatórias de estilo:
-- Tom sempre carinhoso, educado e calmo, mesmo se o cliente for grosseiro.
+Regras obrigatórias:
 - NÃO use o nome do cliente.
-- NÃO comece com "Olá", "Oi", "Oie" etc. (a conversa já está em andamento).
-- NÃO encerre com frases de despedida tipo "aproveite o dia", "tenha um ótimo dia", "até mais".
-- Termine de forma aberta e útil: convide o cliente a continuar (ex.: "Se quiser, posso te ajudar com mais alguma coisa 😊").
+- NÃO comece com saudação (sem "Olá", "Oi", "Oie").
+- NÃO finalize com despedidas/fechamento ("abraços", "aproveite seu dia", "até mais", "é só avisar").
+- Tom carinhoso, calmo e educado sempre.
+- Não invente informações (preços/promoções/regras). Use SOMENTE os trechos fornecidos.
+- Se não houver informação suficiente, peça uma pergunta complementar objetiva.
 
-Regras de veracidade:
-- Não invente preços, promoções, regras ou informações.
-- Se a informação não estiver nos trechos fornecidos, peça esclarecimento ou diga que vai confirmar.
-- Seja curta e objetiva (WhatsApp), mas completa.
-- Pode usar emojis leves (🙏😊✨🍣❤️), sem exagero.
+Formato:
+- Responda direto ao ponto.
+- Máximo ~3 mensagens curtas de WhatsApp (sem textão).
 `.trim();
 
   const context = retrieved
@@ -238,19 +270,16 @@ Regras de veracidade:
     .join("\n\n");
 
   const user = `
-Mensagem do cliente:
+Pergunta do cliente:
 ${question}
 
-Informações do restaurante (trechos do Notion):
+Trechos do Notion:
 ${context || "(nenhuma informação relevante encontrada)"}
 `.trim();
 
   const r = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: OPENAI_MODEL,
       input: [
@@ -265,20 +294,13 @@ ${context || "(nenhuma informação relevante encontrada)"}
   if (!r.ok) throw new Error(`OpenAI failed ${r.status}: ${JSON.stringify(j)}`);
 
   const out = (j.output || []).flatMap((o) => o.content || []);
-  let text = out
+  const raw = out
     .filter((c) => c.type === "output_text")
     .map((c) => c.text)
     .join("")
     .trim();
 
-  // Cintos de segurança:
-  text = text.replace(/^(oi|ol[aá]|oie+)\b[!,. \n-]*/i, "");
-  text = text.replace(
-    /\b(aproveite( o)? seu dia|tenha um (otimo|ótimo) dia|ate mais|até mais)\b\.?\s*$/i,
-    ""
-  );
-
-  return text.trim() || "Perfeito! 😊 Como posso te ajudar?";
+  return sanitizeAnswer(raw);
 }
 
 // ===== HTTP server =====
@@ -292,7 +314,7 @@ const server = http.createServer((req, res) => {
   req.on("data", (c) => buf.push(c));
 
   req.on("end", async () => {
-    // responde rápido pro webhook do Evolution
+    // responde rápido pro webhook
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     res.end("OK");
 
@@ -318,7 +340,7 @@ const server = http.createServer((req, res) => {
 
       await ensureKnowledgeFresh();
 
-      // 1) Boas-vindas exata
+      // 1) Boas-vindas exata (apenas se o cliente mandou saudação)
       if (looksLikeGreeting(incomingText)) {
         const welcome =
           (await notionFindExactByName(NOTION_DB_RESTAURANTE, NOTION_WELCOME_NAME)) ||
