@@ -1,15 +1,3 @@
-/**
- * Tsunagari WhatsApp Bot (v1)
- * - Webhook: Evolution API event=messages.upsert
- * - Saudação ("oi/olá...") => responde com texto EXATO do Notion
- * - Outras dúvidas => Notion (trechos) + OpenAI, sem inventar
- *
- * Ajustes obrigatórios:
- * - NÃO usar nome do cliente
- * - NÃO começar com "Olá/Oi"
- * - NÃO encerrar com "abraços", "até mais", "aproveite o dia", "é só avisar" etc.
- */
-
 const http = require("http");
 
 // ===== ENV =====
@@ -150,7 +138,6 @@ async function loadKnowledge() {
     { name: "reservas", id: NOTION_DB_RESERVAS },
     { name: "regras", id: NOTION_DB_REGRAS },
   ];
-
   if (NOTION_DB_CARDAPIO) dbs.push({ name: "cardapio", id: NOTION_DB_CARDAPIO });
 
   const all = [];
@@ -165,7 +152,7 @@ async function loadKnowledge() {
 }
 
 async function ensureKnowledgeFresh() {
-  const maxAgeMs = 5 * 60 * 1000; // 5 min
+  const maxAgeMs = 5 * 60 * 1000;
   if (Date.now() - lastLoadAt > maxAgeMs) await loadKnowledge();
 }
 
@@ -189,7 +176,7 @@ async function evolutionSendText({ remoteJid, text }) {
   return body;
 }
 
-// ===== Simple retrieve (keyword) =====
+// ===== Retrieve (keyword) =====
 function simpleRetrieve(question, knowledgeRows, k = 12) {
   const q = normalizeText(question);
   const qWords = new Set(q.split(" ").filter((w) => w.length >= 3));
@@ -206,18 +193,43 @@ function simpleRetrieve(question, knowledgeRows, k = 12) {
   return scored.slice(0, k).map((x) => x.row);
 }
 
-// ===== Output sanitizer (remove greeting+name, remove closings) =====
-function sanitizeAnswer(text) {
+// ===== Output sanitizer =====
+function shouldAllowLinks(question) {
+  const q = normalizeText(question);
+  // só permitir links quando o cliente pedir/for claramente sobre link/cardápio/endereço
+  return (
+    q.includes("link") ||
+    q.includes("cardapio") ||
+    q.includes("cardápio") ||
+    q.includes("menu") ||
+    q.includes("endereco") ||
+    q.includes("endereço") ||
+    q.includes("maps") ||
+    q.includes("localizacao") ||
+    q.includes("localização") ||
+    q.includes("como chegar")
+  );
+}
+
+function stripLinks(text) {
+  // remove URLs + markdown-style [texto](url)
+  let t = text;
+  t = t.replace(/\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/gi, "[link removido]");
+  t = t.replace(/https?:\/\/\S+/gi, "");
+  return t;
+}
+
+function sanitizeAnswer(text, question) {
   let t = (text || "").trim();
 
-  // Remove leading greeting + optional name: "Olá, Bê" / "Oi Maria" / "Oiee, fulano"
+  // remove "Olá, Fulano" / "Oi Maria" etc.
   t = t.replace(
     /^(oi|ol[aá]|oie+)\s*[!,.:;\-–—]*\s*(?:[A-Za-zÀ-ÿ0-9_.-]{2,30})?\s*[!,.:;\-–—]*\s*/i,
     ""
   );
 
-  // Remove common closings at end (and repeated)
-  const closingPatterns = [
+  // remove encerramentos
+  const closings = [
     /\babracos\b\.?\s*$/i,
     /\babraços\b\.?\s*$/i,
     /\baproveite( o)? seu dia\b\.?\s*$/i,
@@ -229,40 +241,41 @@ function sanitizeAnswer(text) {
     /\bé so avisar\b\.?\s*$/i,
     /\bé só avisar\b\.?\s*$/i,
   ];
-
   let changed = true;
   while (changed) {
     changed = false;
     const before = t;
-    for (const re of closingPatterns) t = t.replace(re, "");
+    for (const re of closings) t = t.replace(re, "");
     t = t.trim();
     if (t !== before) changed = true;
   }
 
-  // Keep it open but not "goodbye"
-  if (!/[?]\s*$/.test(t)) {
-    t = (t + "\n\nSe quiser, posso te ajudar com mais alguma coisa 😊").trim();
+  // remove links se a pergunta não pediu link
+  if (!shouldAllowLinks(question)) {
+    t = stripLinks(t).replace(/\s+\n/g, "\n").trim();
   }
 
+  // não adiciona frase final automática
   return t.trim();
 }
 
-// ===== OpenAI (Responses API) =====
+// ===== OpenAI =====
 async function openaiAnswer({ question, retrieved }) {
   const sys = `
 Você é a Liz, assistente do restaurante Tsunagari (WhatsApp).
 
 Regras obrigatórias:
 - NÃO use o nome do cliente.
-- NÃO comece com saudação (sem "Olá", "Oi", "Oie").
-- NÃO finalize com despedidas/fechamento ("abraços", "aproveite seu dia", "até mais", "é só avisar").
-- Tom carinhoso, calmo e educado sempre.
-- Não invente informações (preços/promoções/regras). Use SOMENTE os trechos fornecidos.
-- Se não houver informação suficiente, peça uma pergunta complementar objetiva.
+- NÃO comece com saudação ("Olá", "Oi", "Oie").
+- Responda SOMENTE o que o cliente perguntou. Não mude de assunto.
+- NÃO envie links a menos que o cliente peça explicitamente um link (ex.: "me manda o link do cardápio").
+- NÃO finalize com despedidas/fechamento ("abraços", "aproveite o dia", "até mais", "é só avisar").
+- Tom carinhoso e educado.
+- Não invente informações; use apenas os trechos fornecidos.
+- Se fizer follow-up, no máximo 1 pergunta curta e opcional (ex.: "Quer que eu te envie a carta de vinhos?").
 
 Formato:
-- Responda direto ao ponto.
-- Máximo ~3 mensagens curtas de WhatsApp (sem textão).
+- 1 a 3 linhas curtas, estilo WhatsApp.
 `.trim();
 
   const context = retrieved
@@ -300,7 +313,7 @@ ${context || "(nenhuma informação relevante encontrada)"}
     .join("")
     .trim();
 
-  return sanitizeAnswer(raw);
+  return sanitizeAnswer(raw, question);
 }
 
 // ===== HTTP server =====
@@ -314,7 +327,6 @@ const server = http.createServer((req, res) => {
   req.on("data", (c) => buf.push(c));
 
   req.on("end", async () => {
-    // responde rápido pro webhook
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     res.end("OK");
 
@@ -340,21 +352,17 @@ const server = http.createServer((req, res) => {
 
       await ensureKnowledgeFresh();
 
-      // 1) Boas-vindas exata (apenas se o cliente mandou saudação)
       if (looksLikeGreeting(incomingText)) {
         const welcome =
           (await notionFindExactByName(NOTION_DB_RESTAURANTE, NOTION_WELCOME_NAME)) ||
           "Oieeee❤️\nAqui é a Liz! Assistente do Tsunagari.\nConte comigo!";
         await evolutionSendText({ remoteJid, text: welcome });
-        console.log("welcome_sent", remoteJid);
         return;
       }
 
-      // 2) Dúvidas gerais
       const retrieved = simpleRetrieve(incomingText, KNOWLEDGE, 12);
       const answer = await openaiAnswer({ question: incomingText, retrieved });
       await evolutionSendText({ remoteJid, text: answer });
-      console.log("answered", remoteJid, "q:", incomingText);
     } catch (e) {
       console.error("handler_error", e?.message || e);
     }
