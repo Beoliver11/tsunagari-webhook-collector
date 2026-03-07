@@ -1,16 +1,27 @@
 /**
  * Tsunagari WhatsApp Bot (Evolution + Notion + Trello + OpenAI)
- * - Reservation flow: collects Nome / Data / Horário / Adultos+Crianças (ou total fallback)
- * - Creates Trello card per date-list
- * - General Q&A: retrieve from Notion + OpenAI
  *
- * Fixes included:
- * - Greeting detection robust: "Olá," / "Olá!" works
- * - Name parsing: captures full name (not only first word) + smart inference when user sends all fields together
- * - People parsing: keeps adults/children (does not sum to just total); uses total only as fallback
- * - Hour max: responds softly suggesting RESERVA_HORA_MAX and waits confirmation ("ok/sim/pode") to set it
- * - Link handling: if user didn't ask for link, remove it fully; if asked, convert markdown links to plain URL
- * - PORT support for EasyPanel: uses process.env.PORT
+ * Inclui:
+ * - Reserva: pede dados, valida domingo fechado, valida hora limite (sugere 19:45), cria card no Trello
+ * - Nome completo (corrigido) + inferência de nome quando vem tudo junto
+ * - Adultos/crianças separado (card: "3ad+1c"; confirmação: "3 adultos e 1 criança")
+ * - Saudação robusta ("Olá," / "Olá! vim do instagram")
+ * - Anti-pergunta boba (pizza/hambúrguer etc) com resposta fixa (sem LLM)
+ * - Detecção de "pedido" (pedido/delivery/retirar/ifood etc): avisa você via WhatsApp (ADMIN)
+ *
+ * ENV obrigatórias (como você já tem):
+ * - OPENAI_API_KEY, OPENAI_MODEL
+ * - NOTION_TOKEN
+ * - EVOLUTION_SERVER_URL, EVOLUTION_APIKEY, EVOLUTION_INSTANCE
+ * - TRELLO_KEY, TRELLO_TOKEN, TRELLO_BOARD_ID
+ *
+ * ENV recomendadas:
+ * - PORT
+ * - ADMIN_WHATSAPP (ex: "5561999992938")  // número que recebe alertas
+ * - RESERVA_HORA_MAX (default 19:45)
+ * - RESERVA_MAX_TOTAL_DIA (default 13)
+ * - RESERVA_MAX_2P_DIA (default 4)
+ * - FECHADO_DOMINGO ("1" default 1)
  */
 
 const http = require("http");
@@ -28,6 +39,9 @@ const {
   EVOLUTION_APIKEY,
   EVOLUTION_INSTANCE = "n8n Tsunagari",
   EVOLUTION_SEND_PATH = "/message/sendText",
+
+  // Admin alerts
+  ADMIN_WHATSAPP = "",
 
   // Notion
   NOTION_TOKEN,
@@ -49,6 +63,9 @@ const {
   RESERVA_MAX_TOTAL_DIA = "13",
   RESERVA_MAX_2P_DIA = "4",
   RESERVA_HORA_MAX = "19:45",
+
+  // Calendar rules
+  FECHADO_DOMINGO = "1",
 } = process.env;
 
 function must(name, val) {
@@ -66,7 +83,6 @@ function normalizeText(s) {
     .trim();
 }
 
-// robust greeting ("Olá,", "Olá!" etc)
 function looksLikeGreeting(text) {
   const t = normalizeText(text);
   return /^(oi|ola|oie+|bom dia|boa tarde|boa noite)\b/.test(t);
@@ -250,6 +266,15 @@ async function evolutionSendText({ remoteJid, text }) {
   return body;
 }
 
+async function notifyAdmin(text) {
+  if (!ADMIN_WHATSAPP) return;
+  try {
+    await evolutionSendText({ remoteJid: `${ADMIN_WHATSAPP}@s.whatsapp.net`, text });
+  } catch (e) {
+    console.error("admin_notify_failed", e?.message || e);
+  }
+}
+
 // ===== Retrieve =====
 function simpleRetrieve(question, knowledgeRows, k = 12) {
   const q = normalizeText(question);
@@ -273,32 +298,32 @@ function shouldAllowLinks(question) {
   return (
     q.includes("link") ||
     q.includes("cardapio") ||
+    q.includes("cardápio") ||
     q.includes("menu") ||
     q.includes("endereco") ||
+    q.includes("endereço") ||
     q.includes("maps") ||
     q.includes("localizacao") ||
+    q.includes("localização") ||
     q.includes("como chegar")
   );
 }
 
 function unmarkdownLinks(t) {
-  // "[cardápio](https://...)" => "https://..."
   return (t || "").replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/gi, "$2");
 }
 
 function stripLinks(text) {
   let t = text || "";
-  // remove markdown links entirely
-  t = t.replace(/\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/gi, "");
-  // remove raw urls
-  t = t.replace(/https?:\/\/\S+/gi, "");
+  t = t.replace(/\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/gi, ""); // remove markdown link whole
+  t = t.replace(/https?:\/\/\S+/gi, ""); // remove raw urls
   return t;
 }
 
 function sanitizeAnswer(text, question) {
   let t = (text || "").trim();
 
-  // remove leading greeting + optional name
+  // remove leading greeting
   t = t.replace(
     /^(oi|ol[aá]|oie+)\s*[!,.:;\-–—]*\s*(?:[A-Za-zÀ-ÿ0-9_.-]{2,30})?\s*[!,.:;\-–—]*\s*/i,
     ""
@@ -313,7 +338,6 @@ function sanitizeAnswer(text, question) {
     /\bate mais\b\.?\s*$/i,
     /\baté mais\b\.?\s*$/i,
   ];
-
   let changed = true;
   while (changed) {
     changed = false;
@@ -323,13 +347,9 @@ function sanitizeAnswer(text, question) {
     if (t !== before) changed = true;
   }
 
-  if (shouldAllowLinks(question)) {
-    t = unmarkdownLinks(t);
-  } else {
-    t = stripLinks(t);
-  }
+  if (shouldAllowLinks(question)) t = unmarkdownLinks(t);
+  else t = stripLinks(t);
 
-  // clean extra spaces/blank lines
   t = t.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
   return t.trim();
 }
@@ -394,9 +414,27 @@ Trechos do Notion: ${context || "(nenhuma informação relevante encontrada)"}
   return sanitizeAnswer(raw, question);
 }
 
+// ===== Hard rules: non-japanese food + order intent =====
+function asksNonJapaneseFood(text) {
+  const t = normalizeText(text);
+  return /\b(pizza|hamburguer|hamburger|hambúrguer|burger|x[-\s]?burger|lanche|esfiha|pastel|churrasco|lasanha|macarrao|macarrão)\b/.test(
+    t
+  );
+}
+
+function looksLikeOrderIntent(text) {
+  const t = normalizeText(text);
+  // gente tentando "pedir comida" no whatsapp
+  return (
+    /\b(pedido|pedir|quero pedir|vou querer|me ve|me vê|manda|entrega|delivery|retirar|take away|para viagem)\b/.test(
+      t
+    ) ||
+    /\b(ifood|i-food|ubereats|uber eats|rappi)\b/.test(t)
+  );
+}
+
 // ===== Reserva parsing =====
 function parseDateToListName(text) {
-  // accepts dd/mm, dd/mm/yy, dd/mm/yyyy
   const m = text.match(/\b([0-3]?\d)\/([01]?\d)(?:\/(\d{2}|\d{4}))?\b/);
   if (!m) return null;
 
@@ -410,8 +448,21 @@ function parseDateToListName(text) {
   } else if (yy.length === 4) {
     yy = yy.slice(-2);
   }
-
   return `${dd}/${mm}/${yy}`;
+}
+
+function parseDateBR(text) {
+  const m = text.match(/\b([0-3]?\d)\/([01]?\d)(?:\/(\d{2}|\d{4}))?\b/);
+  if (!m) return null;
+  const dd = Number(m[1]);
+  const mm = Number(m[2]);
+  let yyyy = m[3] ? Number(m[3].length === 2 ? "20" + m[3] : m[3]) : new Date().getFullYear();
+  return { dd, mm, yyyy };
+}
+
+function isSundayBR({ dd, mm, yyyy }) {
+  const d = new Date(Date.UTC(yyyy, mm - 1, dd));
+  return d.getUTCDay() === 0;
 }
 
 function parseTime(text) {
@@ -420,7 +471,6 @@ function parseTime(text) {
   return `${m[1].padStart(2, "0")}:${m[2]}`;
 }
 
-// "Nome: Bernardo Oliveira" => full
 function parseName(text) {
   const m = text.match(/nome\s*[:\-]\s*([^\n\r]+)/i);
   if (m) return m[1].trim();
@@ -431,7 +481,6 @@ function parseName(text) {
   return null;
 }
 
-// infer name if message starts with name then has date/time later
 function parseNameSmart(text) {
   const explicit = parseName(text);
   if (explicit) return explicit;
@@ -465,15 +514,12 @@ function parseNameSmart(text) {
 function parseAdultsChildren(text) {
   const t = normalizeText(text);
 
-  // "3 adultos e 1 criança"
   const m = t.match(/\b(\d+)\s*adult[oa]s?\b.*?\b(\d+)\s*crianc[ao]s?\b/);
   if (m) return { adultos: Number(m[1]), criancas: Number(m[2]) };
 
-  // "3 adultos"
   const mA = t.match(/\b(\d+)\s*adult[oa]s?\b/);
   if (mA) return { adultos: Number(mA[1]), criancas: 0 };
 
-  // "1 criança"
   const mC = t.match(/\b(\d+)\s*crianc[ao]s?\b/);
   if (mC) return { adultos: 0, criancas: Number(mC[1]) };
 
@@ -483,11 +529,9 @@ function parseAdultsChildren(text) {
 function parsePeopleTotalFallback(text) {
   const t = normalizeText(text);
 
-  // "4 pessoas"
   const m2 = t.match(/\b(\d+)\s*(pessoas|pessoa|lugares|lugar)\b/);
   if (m2) return Number(m2[1]);
 
-  // fallback: last number (avoid hour)
   const nums = [...t.matchAll(/\b(\d{1,2})\b/g)].map((x) => Number(x[1]));
   if (nums.length) {
     const time = parseTime(text);
@@ -498,7 +542,6 @@ function parsePeopleTotalFallback(text) {
     }
     return nums[nums.length - 1];
   }
-
   return null;
 }
 
@@ -585,7 +628,6 @@ async function trelloEnsureList(boardId, listName) {
 }
 
 function parsePeopleFromCardName(name) {
-  // "... - 4" OR "... - 3ad+1c"
   const m = (name || "").match(/-\s*(\d{1,2})\s*$/);
   if (m) return Number(m[1]);
 
@@ -619,7 +661,6 @@ async function getNotionReservaTemplate(name, fallback) {
   return t && t.trim() ? t.trim() : fallback;
 }
 
-// optional: use Notion template "Mensagem para mandar para o cliente da confirmaçao da reserva" if exists
 async function buildConfirmMessageFromNotionOrFallback({ nome, dataList, hora, peopleLabel }) {
   const tpl =
     (await notionFindExactByName(
@@ -628,8 +669,6 @@ async function buildConfirmMessageFromNotionOrFallback({ nome, dataList, hora, p
     )) || "";
 
   if (tpl.trim()) {
-    // replace the placeholder block heuristically
-    // We keep the vibe and just inject the final RESERVA data.
     const reservaBlock =
       `RESERVA:\n\n` +
       `Nome: ${nome}\n` +
@@ -637,16 +676,13 @@ async function buildConfirmMessageFromNotionOrFallback({ nome, dataList, hora, p
       `N° de pessoas: ${peopleLabel}\n` +
       `Horário: ${hora}`;
 
-    // If template already contains "RESERVA:" block, replace it; else append.
     if (/RESERVA:/i.test(tpl)) {
-      // Replace from "RESERVA:" to end OR to next double-newline chunk
       const replaced = tpl.replace(/RESERVA:\s*[\s\S]*$/i, reservaBlock);
       return replaced.trim();
     }
     return (tpl.trim() + "\n\n" + reservaBlock).trim();
   }
 
-  // fallback
   return (
     `Perfeito! 😊\n` +
     `Reserva confirmada:\n\n` +
@@ -700,7 +736,7 @@ const server = http.createServer((req, res) => {
       const state = loadState();
       await ensureKnowledgeFresh();
 
-      // 1) greeting => exact welcome from Notion
+      // (A) Saudação => welcome Notion
       if (looksLikeGreeting(incomingText)) {
         const welcome =
           (await notionFindExactByName(NOTION_DB_RESTAURANTE, NOTION_WELCOME_NAME)) ||
@@ -709,21 +745,51 @@ const server = http.createServer((req, res) => {
         return;
       }
 
-      // 2) Reserva flow
+      // (B) Pergunta “pizza/hambúrguer” etc => resposta fixa
+      if (asksNonJapaneseFood(incomingText)) {
+        await evolutionSendText({
+          remoteJid,
+          text:
+            "A gente é um restaurante japonês 🍣✨ Então não trabalhamos com pizza/hambúrguer.\nQuer que eu te mande nosso cardápio ou te explico as opções do rodízio?",
+        });
+        return;
+      }
+
+      // (C) Tentativa de “fazer pedido” => avisa você + responde cliente
+      // Obs: só dispara fora do fluxo de reserva, pra não confundir
       const existing = getConv(state, remoteJid);
       const inReservaFlow = existing?.mode === "reserva";
 
+      if (!inReservaFlow && looksLikeOrderIntent(incomingText)) {
+        const from = remoteJid.split("@")[0];
+        await notifyAdmin(
+          `⚠️ POSSÍVEL PEDIDO (precisa de atendimento humano)\nCliente: ${from}\nMensagem: ${incomingText}`
+        );
+
+        await evolutionSendText({
+          remoteJid,
+          text:
+            "Entendi! 😊 Só um instante que vou chamar alguém da equipe pra te ajudar por aqui. 🍣",
+        });
+        return;
+      }
+
+      // (D) Reserva flow
       if (looksLikeReservaIntent(incomingText) || inReservaFlow) {
         const conv =
           existing && inReservaFlow
             ? existing
             : { mode: "reserva", data: {}, startedAt: Date.now() };
 
-        // if we suggested the max hour and user confirmed
+        // if we suggested max hour and user confirmed
         if (conv?.awaitingHoraMaxConfirm && isAffirmative(incomingText)) {
           conv.data.hora = RESERVA_HORA_MAX;
           conv.awaitingHoraMaxConfirm = false;
         }
+
+        // parse date object (for sunday validation)
+        const dateObjNow = parseDateBR(incomingText);
+        if (dateObjNow) conv.data.dateObj = dateObjNow;
 
         // Extract fields from this message
         const nome = parseNameSmart(incomingText);
@@ -750,6 +816,17 @@ const server = http.createServer((req, res) => {
         }
 
         setConv(state, remoteJid, conv);
+
+        // Sunday validation (if we already have a date)
+        if (FECHADO_DOMINGO !== "0" && conv.data.dateObj && isSundayBR(conv.data.dateObj)) {
+          await evolutionSendText({
+            remoteJid,
+            text:
+              "A gente não abre aos domingos 🙂\nQuer reservar pra outro dia? Funcionamos de segunda a sábado, 18:30 às 23h. 🍣",
+          });
+          clearConv(state, remoteJid);
+          return;
+        }
 
         // Missing fields
         const missing = [];
@@ -809,7 +886,6 @@ const server = http.createServer((req, res) => {
         }
 
         const totalForLimits = peopleTotalFromConvData(conv.data);
-
         const isTwoPeople =
           totalForLimits === 2 &&
           (conv.data.adultos == null ||
@@ -819,8 +895,7 @@ const server = http.createServer((req, res) => {
           await evolutionSendText({
             remoteJid,
             text:
-              `Hoje já atingimos o limite de reservas para 2 pessoas. 😊\n` +
-              `Mas você pode vir sem reserva por ordem de chegada. 🍣✨`,
+              "Hoje já atingimos o limite de reservas para 2 pessoas. 😊\nMas você pode vir sem reserva por ordem de chegada. 🍣✨",
           });
           clearConv(state, remoteJid);
           return;
@@ -834,7 +909,7 @@ const server = http.createServer((req, res) => {
           listId: list.id,
           nome: conv.data.nome,
           hora: conv.data.hora,
-          pessoasLabel: pessoasCard, // e.g. "3ad+1c" or "4"
+          pessoasLabel: pessoasCard,
           telefone,
         });
 
@@ -855,7 +930,7 @@ const server = http.createServer((req, res) => {
         return;
       }
 
-      // 3) General doubts => Notion + OpenAI
+      // (E) General doubts => Notion + OpenAI
       const retrieved = simpleRetrieve(incomingText, KNOWLEDGE, 12);
       const answer = await openaiAnswer({ question: incomingText, retrieved });
       await evolutionSendText({ remoteJid, text: answer });
@@ -873,6 +948,9 @@ const server = http.createServer((req, res) => {
     console.error("initial_load_failed", e?.message || e);
   }
 
+  const PORT = Number(process.env.PORT || 3000);
+  server.listen(PORT, () => console.log("Tsunagari bot v2 on :" + PORT));
+})();
   const PORT = Number(process.env.PORT || 3000);
   server.listen(PORT, () => console.log("Tsunagari bot v2 on :" + PORT));
 })();
