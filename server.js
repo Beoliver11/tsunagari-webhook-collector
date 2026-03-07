@@ -45,15 +45,17 @@ function normalizeText(s) {
     .toLowerCase()
     .normalize("NFD")
     .replace(/\p{Diacritic}/gu, "")
+    .replace(/[“”]/g, '"')
+    .replace(/[’]/g, "'")
     .replace(/\s+/g, " ")
     .trim();
 }
 
+// FIX: saudação robusta ("Olá,", "Olá!" etc)
 function looksLikeGreeting(text) {
   const t = normalizeText(text);
-  return /^(oi|ola|oie+|olá, vim pelo instagram|bom dia|boa tarde|boa noite)\b/.test(t);
+  return /^(oi|ola|oie+|bom dia|boa tarde|boa noite)\b/.test(t);
 }
-
 
 function looksLikeReservaIntent(text) {
   const t = normalizeText(text);
@@ -68,6 +70,24 @@ function looksLikeReservaIntent(text) {
     t.includes("para hoje") ||
     t.includes("pra amanha") ||
     t.includes("para amanha")
+  );
+}
+
+function isAffirmative(text) {
+  const t = normalizeText(text);
+  return (
+    t === "sim" ||
+    t === "s" ||
+    t === "ok" ||
+    t === "okk" ||
+    t === "blz" ||
+    t === "beleza" ||
+    t === "pode" ||
+    t === "pode sim" ||
+    t === "pode ser" ||
+    t === "fechado" ||
+    t === "confirmo" ||
+    t === "confirmado"
   );
 }
 
@@ -373,68 +393,26 @@ function parseTime(text) {
   return `${m[1].padStart(2, "0")}:${m[2]}`;
 }
 
-function parseAdultsChildren(text) {
-  const t = normalizeText(text);
-
-  // "3 adultos e 1 criança"
-  const m = t.match(/\b(\d+)\s*adult[oa]s?\b.*?\b(\d+)\s*crianc[ao]s?\b/);
-  if (m) return { adultos: Number(m[1]), criancas: Number(m[2]) };
-
-  // "3 adultos" (sem criança)
-  const mA = t.match(/\b(\d+)\s*adult[oa]s?\b/);
-  if (mA) return { adultos: Number(mA[1]), criancas: 0 };
-
-  // "1 criança" (sem adulto)
-  const mC = t.match(/\b(\d+)\s*crianc[ao]s?\b/);
-  if (mC) return { adultos: 0, criancas: Number(mC[1]) };
-
-  return null;
-}
-
-function parsePeopleTotalFallback(text) {
-  const t = normalizeText(text);
-
-  const m2 = t.match(/\b(\d+)\s*(pessoas|pessoa|lugares|lugar)\b/);
-  if (m2) return Number(m2[1]);
-
-  const nums = [...t.matchAll(/\b(\d{1,2})\b/g)].map((x) => Number(x[1]));
-  if (nums.length) {
-    const time = parseTime(text);
-    if (time) {
-      const hour = Number(time.split(":")[0]);
-      const filtered = nums.filter((n) => n !== hour);
-      if (filtered.length) return filtered[filtered.length - 1];
-    }
-    return nums[nums.length - 1];
-  }
-  return null;
-}
-
-// FIX 1: parse "Nome: Bernardo Oliveira" (pega a linha inteira)
+// FIX: pegar nome completo após "Nome:"
 function parseName(text) {
-  // "Nome: Bernardo Oliveira"
   const m = text.match(/nome\s*[:\-]\s*([^\n\r]+)/i);
   if (m) return m[1].trim();
 
-  // "no nome de Bernardo Oliveira"
   const m2 = text.match(/no nome de\s+([^\n\r]+)/i);
   if (m2) return m2[1].trim();
 
   return null;
 }
 
-// FIX 2: quando o cliente manda tudo junto (nome + data + hora + pessoas), inferir nome
+// FIX: quando o cliente manda tudo junto (nome + data/hora...), inferir nome
 function parseNameSmart(text) {
-  // 1) Se já tem Nome: ..., usa isso
   const explicit = parseName(text);
   if (explicit) return explicit;
 
   const hasDate = /\b([0-3]?\d)\/([01]?\d)(?:\/(\d{2}|\d{4}))?\b/.test(text);
   const hasTime = /\b([01]?\d|2[0-3])[:h]([0-5]\d)\b/.test(text);
-
   if (!hasDate && !hasTime) return null;
 
-  // pega o começo da mensagem até antes da data ou da hora
   const idxDate = text.search(/\b([0-3]?\d)\/([01]?\d)(?:\/(\d{2}|\d{4}))?\b/);
   const idxTime = text.search(/\b([01]?\d|2[0-3])[:h]([0-5]\d)\b/);
 
@@ -445,31 +423,57 @@ function parseNameSmart(text) {
   if (cut <= 0) return null;
 
   let candidate = text.slice(0, cut).trim();
-
-  // limpar pontuação comum no começo/fim
   candidate = candidate.replace(/^[\-\s:–—]+/, "").replace(/[\-\s:–—]+$/, "").trim();
-
-  // se a pessoa colocou "3 adultos..." antes da data (raro), remove números no começo
   candidate = candidate.replace(/^\d+\s+/, "").trim();
 
-  // limitar tamanho (nome)
   const words = candidate.split(/\s+/).filter(Boolean);
-  if (words.length < 1) return null;
+  if (!words.length) return null;
 
-  // evita pegar "Reserva" / "Quero reservar" como nome
-  const badStarters = new Set([
-    "reserva",
-    "reservar",
-    "quero",
-    "mesa",
-    "agendar",
-    "marcar",
-  ]);
-  if (words.length === 1 && badStarters.has(normalizeText(words[0]))) return null;
+  const bad = new Set(["reserva", "reservar", "quero", "mesa", "agendar", "marcar"]);
+  if (words.length === 1 && bad.has(normalizeText(words[0]))) return null;
 
-  // se vier muito grande, corta para 4 palavras
-  const cleaned = words.slice(0, 4).join(" ").trim();
-  return cleaned || null;
+  return words.slice(0, 4).join(" ").trim() || null;
+}
+
+// FIX: adultos/crianças separado (não somar e perder info)
+function parseAdultsChildren(text) {
+  const t = normalizeText(text);
+
+  // "3 adultos e 1 criança"
+  const m = t.match(/\b(\d+)\s*adult[oa]s?\b.*?\b(\d+)\s*crianc[ao]s?\b/);
+  if (m) return { adultos: Number(m[1]), criancas: Number(m[2]) };
+
+  // "3 adultos"
+  const mA = t.match(/\b(\d+)\s*adult[oa]s?\b/);
+  if (mA) return { adultos: Number(mA[1]), criancas: 0 };
+
+  // "1 criança"
+  const mC = t.match(/\b(\d+)\s*crianc[ao]s?\b/);
+  if (mC) return { adultos: 0, criancas: Number(mC[1]) };
+
+  return null;
+}
+
+function parsePeopleTotalFallback(text) {
+  const t = normalizeText(text);
+
+  // "para 4 pessoas"
+  const m2 = t.match(/\b(\d+)\s*(pessoas|pessoa|lugares|lugar)\b/);
+  if (m2) return Number(m2[1]);
+
+  // fallback: last number in message (avoiding hour)
+  const nums = [...t.matchAll(/\b(\d{1,2})\b/g)].map((x) => Number(x[1]));
+  if (nums.length) {
+    const time = parseTime(text);
+    if (time) {
+      const hour = Number(time.split(":")[0]);
+      const filtered = nums.filter((n) => n !== hour);
+      if (filtered.length) return filtered[filtered.length - 1];
+    }
+    return nums[nums.length - 1];
+  }
+
+  return null;
 }
 
 function timeToMinutes(hhmm) {
@@ -479,6 +483,30 @@ function timeToMinutes(hhmm) {
 
 function isTimeAllowed(hhmm) {
   return timeToMinutes(hhmm) <= timeToMinutes(RESERVA_HORA_MAX);
+}
+
+function peopleTotalFromConvData(data) {
+  if (data?.adultos != null && data?.criancas != null) {
+    return Number(data.adultos) + Number(data.criancas);
+  }
+  if (data?.pessoasTotal != null) return Number(data.pessoasTotal);
+  return null;
+}
+
+function peopleLabelFromConvData(data) {
+  if (data?.adultos != null && data?.criancas != null) {
+    return `${data.adultos} adultos e ${data.criancas} criança${Number(data.criancas) === 1 ? "" : "s"}`;
+  }
+  if (data?.pessoasTotal != null) return `${data.pessoasTotal} pessoa${Number(data.pessoasTotal) === 1 ? "" : "s"}`;
+  return "";
+}
+
+function peopleShortLabelFromConvData(data) {
+  if (data?.adultos != null && data?.criancas != null) {
+    return `${data.adultos}ad+${data.criancas}c`;
+  }
+  if (data?.pessoasTotal != null) return String(data.pessoasTotal);
+  return "";
 }
 
 // ===== Trello helpers =====
@@ -528,10 +556,14 @@ async function trelloEnsureList(boardId, listName) {
 }
 
 function parsePeopleFromCardName(name) {
-  // expected: "Nome - HH:MM - N"
+  // expected: "... - N" OR "... - 3ad+1c"
   const m = (name || "").match(/-\s*(\d{1,2})\s*$/);
-  if (!m) return null;
-  return Number(m[1]);
+  if (m) return Number(m[1]);
+
+  const m2 = (name || "").match(/-\s*(\d{1,2})\s*ad\+\s*(\d{1,2})\s*c\s*$/i);
+  if (m2) return Number(m2[1]) + Number(m2[2]);
+
+  return null;
 }
 
 async function trelloCountList(listId) {
@@ -543,8 +575,8 @@ async function trelloCountList(listId) {
   return { total, twoP };
 }
 
-async function trelloCreateReservaCard({ listId, nome, hora, pessoas, telefone }) {
-  const title = `${nome} - ${hora} - ${pessoas}`;
+async function trelloCreateReservaCard({ listId, nome, hora, pessoasLabel, telefone }) {
+  const title = `${nome} - ${hora} - ${pessoasLabel}`;
   const desc = `Telefone/WhatsApp: ${telefone}`;
   return await trelloPost(`https://api.trello.com/1/cards?idList=${listId}`, {
     name: title,
@@ -558,15 +590,15 @@ async function getNotionReservaTemplate(name, fallback) {
   return t && t.trim() ? t.trim() : fallback;
 }
 
-function buildConfirmMessage({ nome, dataList, hora, pessoas }) {
+function buildConfirmMessage({ nome, dataList, hora, peopleLabel }) {
   return (
-    `Perfeito! 😊 ` +
-    `Reserva confirmada:\n` +
+    `Perfeito! 😊\n` +
+    `Reserva confirmada:\n\n` +
     `Nome: ${nome}\n` +
     `Data: ${dataList}\n` +
-    `Horário: ${hora}\n` +
-    `Pessoas: ${pessoas}\n` +
-    `⏰ Tolerância de 15min. Após esse período, a mesa pode ser liberada pra quem estiver aguardando.\n` +
+    `N° de pessoas: ${peopleLabel}\n` +
+    `Horário: ${hora}\n\n` +
+    `❗ 15 minutos de tolerância - Após este período, a mesa pode ser liberada para quem está na fila de espera.\n\n` +
     `Se precisar alterar ou cancelar, é só avisar! 🍣✨`
   );
 }
@@ -616,7 +648,7 @@ const server = http.createServer((req, res) => {
       if (looksLikeGreeting(incomingText)) {
         const welcome =
           (await notionFindExactByName(NOTION_DB_RESTAURANTE, NOTION_WELCOME_NAME)) ||
-          "Oieeee❤️ Aqui é a Liz! Assistente do Tsunagari. Conte comigo!";
+          "Oieeee❤️\nAqui é a Liz! Assistente do Tsunagari.\nConte comigo!";
         await evolutionSendText({ remoteJid, text: welcome });
         return;
       }
@@ -631,26 +663,33 @@ const server = http.createServer((req, res) => {
             ? existing
             : { mode: "reserva", data: {}, startedAt: Date.now() };
 
+        // Se o bot acabou de sugerir 19:45 e o cliente respondeu "sim/ok/pode"
+        if (conv?.awaitingHoraMaxConfirm && isAffirmative(incomingText)) {
+          conv.data.hora = RESERVA_HORA_MAX;
+          conv.awaitingHoraMaxConfirm = false;
+        }
+
         // Extract possible fields from this message
         const nome = parseNameSmart(incomingText);
         const dataList = parseDateToListName(incomingText);
         const hora = parseTime(incomingText);
-        const ac = parseAdultsChildren(incomingText);
-if (ac) {
-  // só atualiza se vier algo explícito
-  if (ac.adultos !== null) conv.data.adultos = ac.adultos;
-  if (ac.criancas !== null) conv.data.criancas = ac.criancas;
-} else {
-  // fallback: "4 pessoas"
-  const total = parsePeopleTotalFallback(incomingText);
-  if (total) conv.data.pessoasTotal = total;
-}
 
+        const ac = parseAdultsChildren(incomingText);
+        const totalFallback = parsePeopleTotalFallback(incomingText);
 
         if (nome) conv.data.nome = nome;
         if (dataList) conv.data.dataList = dataList;
         if (hora) conv.data.hora = hora;
-        if (pessoas) conv.data.pessoas = pessoas;
+
+        if (ac) {
+          conv.data.adultos = ac.adultos;
+          conv.data.criancas = ac.criancas;
+          // se antes tinha total, deixa, mas não é mais necessário
+          conv.data.pessoasTotal = undefined;
+        } else if (totalFallback != null && conv.data.adultos == null && conv.data.criancas == null) {
+          // só guarda total se ainda não tem detalhe
+          conv.data.pessoasTotal = totalFallback;
+        }
 
         setConv(state, remoteJid, conv);
 
@@ -659,12 +698,14 @@ if (ac) {
         if (!conv.data.nome) missing.push("Nome");
         if (!conv.data.dataList) missing.push("Data (DD/MM ou DD/MM/AAAA)");
         if (!conv.data.hora) missing.push("Horário (ex.: 19:30)");
-        if (!conv.data.pessoas) missing.push("Quantidade de pessoas (número)");
+
+        const totalForLimitsNow = peopleTotalFromConvData(conv.data);
+        if (totalForLimitsNow == null) missing.push("N° de pessoas (ex.: 3 adultos e 1 criança)");
 
         if (missing.length) {
           const pedir = await getNotionReservaTemplate(
             "dados para a reserva",
-            "Perfeito! 😊 Pra eu agendar sua reserva, me manda:\nNome:\nData:\nHorário:\nQuantidade de pessoas:"
+            "Para agendar sua reserva precisamos destes dados:\n\nNome:\nData:\nN° de pessoas: X adultos e X crianças\nHorário:\n\nAssim que mandar agendamos sua reserva!"
           );
 
           if (inReservaFlow) {
@@ -680,34 +721,43 @@ if (ac) {
           return;
         }
 
-        // Validate hour
+        // Validate hour (com resposta mais suave)
         if (!isTimeAllowed(conv.data.hora)) {
-          await evolutionSendText({
-            remoteJid,
-            text:
-              `Consigo fazer reserva para chegada até ${RESERVA_HORA_MAX} (com 15min de tolerância). 😊\n` +
-              `Depois desse horário, pode vir sem reserva mesmo, por ordem de chegada. 🍣✨`,
-          });
+          const msg = await getNotionReservaTemplate(
+            "LIMITE HORARIO de reserva",
+            `Posso colocar ${RESERVA_HORA_MAX}?\n\nÉ o limite de horário para reserva.\n\nTem 15min de tolerância. 😊`
+          );
+          conv.awaitingHoraMaxConfirm = true; // espera "ok/sim/pode"
+          setConv(state, remoteJid, conv);
+          await evolutionSendText({ remoteJid, text: msg });
           return;
         }
 
         // Trello capacity check
         const list = await trelloEnsureList(TRELLO_BOARD_ID, conv.data.dataList);
         const counts = await trelloCountList(list.id);
+
         const maxTotal = Number(RESERVA_MAX_TOTAL_DIA);
         const max2p = Number(RESERVA_MAX_2P_DIA);
 
         if (counts.total >= maxTotal) {
           const msg = await getNotionReservaTemplate(
             "limite de reserva(checar trello)",
-            "❗ Já atingimos o limite de reservas para esse dia. Você pode vir sem reserva, por ordem de chegada. 😊"
+            "❗ Já atingimos o limite de reservas para esse dia.\n\nVocê pode vir sem reserva, por ordem de chegada. 😊"
           );
           await evolutionSendText({ remoteJid, text: msg });
           clearConv(state, remoteJid);
           return;
         }
 
-        if (Number(conv.data.pessoas) === 2 && counts.twoP >= max2p) {
+        const totalForLimits = peopleTotalFromConvData(conv.data);
+
+        // Regra 2p: só conta como 2p se total==2 e (se tiver detalhe) não tem criança
+        const isTwoPeople =
+          totalForLimits === 2 &&
+          (conv.data.adultos == null || (Number(conv.data.adultos) === 2 && Number(conv.data.criancas) === 0));
+
+        if (isTwoPeople && counts.twoP >= max2p) {
           await evolutionSendText({
             remoteJid,
             text:
@@ -720,22 +770,26 @@ if (ac) {
 
         // Create card
         const telefone = remoteJid.split("@")[0];
+        const pessoasCard = peopleShortLabelFromConvData(conv.data) || String(totalForLimits);
+
         await trelloCreateReservaCard({
           listId: list.id,
           nome: conv.data.nome,
           hora: conv.data.hora,
-          pessoas: conv.data.pessoas,
+          pessoasLabel: pessoasCard, // exemplo: "3ad+1c" ou "4"
           telefone,
         });
 
-        // Confirm to customer
+        // Confirm to customer (com detalhe adultos/crianças quando tiver)
+        const peopleLabel = peopleLabelFromConvData(conv.data) || `${totalForLimits} pessoas`;
+
         await evolutionSendText({
           remoteJid,
           text: buildConfirmMessage({
             nome: conv.data.nome,
             dataList: conv.data.dataList,
             hora: conv.data.hora,
-            pessoas: conv.data.pessoas,
+            peopleLabel,
           }),
         });
 
