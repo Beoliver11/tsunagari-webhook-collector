@@ -951,6 +951,3 @@ const server = http.createServer((req, res) => {
   const PORT = Number(process.env.PORT || 3000);
   server.listen(PORT, () => console.log("Tsunagari bot v2 on :" + PORT));
 })();
-  const PORT = Number(process.env.PORT || 3000);
-  server.listen(PORT, () => console.log("Tsunagari bot v2 on :" + PORT));
-})();
