@@ -267,8 +267,10 @@ function shouldAllowLinks(question) {
 }
 
 function stripLinks(text) {
-  let t = text;
-  t = t.replace(/\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/gi, "[link removido]");
+  let t = text || "";
+  // remove markdown links inteiros
+  t = t.replace(/\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/gi, "");
+  // remove urls soltas
   t = t.replace(/https?:\/\/\S+/gi, "");
   return t;
 }
