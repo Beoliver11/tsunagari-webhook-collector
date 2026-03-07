@@ -1,4 +1,6 @@
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 
 // ===== ENV =====
 const {
@@ -15,7 +17,6 @@ const {
   // Notion
   NOTION_TOKEN,
   NOTION_WELCOME_NAME = "Mensagem de boas vindas:",
-
   NOTION_DB_RESTAURANTE = "2bf12169-2df7-806a-82cc-d8c1c3e39202",
   NOTION_DB_POLITICA = "2b512169-2df7-80f2-ab82-c358e0393ace",
   NOTION_DB_PRECOS = "2b512169-2df7-8065-84c2-ea856c101a2d",
@@ -23,6 +24,16 @@ const {
   NOTION_DB_RESERVAS = "2b412169-2df7-80c8-ab03-fcd7af2b673e",
   NOTION_DB_REGRAS = "2b512169-2df7-804d-a6ed-f7417e299ef5",
   NOTION_DB_CARDAPIO = "",
+
+  // Trello
+  TRELLO_KEY,
+  TRELLO_TOKEN,
+  TRELLO_BOARD_ID = "692c6640823f97382fc10a57",
+
+  // Reserva rules
+  RESERVA_MAX_TOTAL_DIA = "13",
+  RESERVA_MAX_2P_DIA = "4",
+  RESERVA_HORA_MAX = "19:45",
 } = process.env;
 
 function must(name, val) {
@@ -55,6 +66,22 @@ function looksLikeGreeting(text) {
   );
 }
 
+function looksLikeReservaIntent(text) {
+  const t = normalizeText(text);
+  return (
+    t.includes("reserva") ||
+    t.includes("reservar") ||
+    t.includes("quero reservar") ||
+    t.includes("mesa") ||
+    t.includes("agendar") ||
+    t.includes("marcar") ||
+    t.includes("pra hoje") ||
+    t.includes("para hoje") ||
+    t.includes("pra amanha") ||
+    t.includes("para amanha")
+  );
+}
+
 function extractIncomingText(bodyJson) {
   const msg = bodyJson?.data?.message || {};
   return (
@@ -66,11 +93,35 @@ function extractIncomingText(bodyJson) {
   ).trim();
 }
 
+// ======== Simple persistent state (file) ========
+const STATE_PATH = path.join(process.cwd(), "state.json");
+
+function loadState() {
+  try {
+    return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
+  } catch {
+    return { conversations: {} };
+  }
+}
+function saveState(state) {
+  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2), "utf8");
+}
+function getConv(state, jid) {
+  return state.conversations[jid] || null;
+}
+function setConv(state, jid, conv) {
+  state.conversations[jid] = conv;
+  saveState(state);
+}
+function clearConv(state, jid) {
+  delete state.conversations[jid];
+  saveState(state);
+}
+
 // ===== Notion =====
 async function notionQueryAllRows(dbId, pageSize = 100) {
   let cursor = undefined;
   const rows = [];
-
   for (let i = 0; i < 20; i++) {
     const body = { page_size: pageSize };
     if (cursor) body.start_cursor = cursor;
@@ -97,7 +148,6 @@ async function notionQueryAllRows(dbId, pageSize = 100) {
     if (!j.has_more) break;
     cursor = j.next_cursor;
   }
-
   return rows;
 }
 
@@ -176,7 +226,7 @@ async function evolutionSendText({ remoteJid, text }) {
   return body;
 }
 
-// ===== Retrieve (keyword) =====
+// ===== Retrieve =====
 function simpleRetrieve(question, knowledgeRows, k = 12) {
   const q = normalizeText(question);
   const qWords = new Set(q.split(" ").filter((w) => w.length >= 3));
@@ -193,26 +243,21 @@ function simpleRetrieve(question, knowledgeRows, k = 12) {
   return scored.slice(0, k).map((x) => x.row);
 }
 
-// ===== Output sanitizer =====
+// ===== Answer sanitization (same vibe) =====
 function shouldAllowLinks(question) {
   const q = normalizeText(question);
-  // só permitir links quando o cliente pedir/for claramente sobre link/cardápio/endereço
   return (
     q.includes("link") ||
     q.includes("cardapio") ||
-    q.includes("cardápio") ||
     q.includes("menu") ||
     q.includes("endereco") ||
-    q.includes("endereço") ||
     q.includes("maps") ||
     q.includes("localizacao") ||
-    q.includes("localização") ||
     q.includes("como chegar")
   );
 }
 
 function stripLinks(text) {
-  // remove URLs + markdown-style [texto](url)
   let t = text;
   t = t.replace(/\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/gi, "[link removido]");
   t = t.replace(/https?:\/\/\S+/gi, "");
@@ -222,13 +267,13 @@ function stripLinks(text) {
 function sanitizeAnswer(text, question) {
   let t = (text || "").trim();
 
-  // remove "Olá, Fulano" / "Oi Maria" etc.
+  // remove leading greeting + optional name
   t = t.replace(
     /^(oi|ol[aá]|oie+)\s*[!,.:;\-–—]*\s*(?:[A-Za-zÀ-ÿ0-9_.-]{2,30})?\s*[!,.:;\-–—]*\s*/i,
     ""
   );
 
-  // remove encerramentos
+  // remove “despedidas”
   const closings = [
     /\babracos\b\.?\s*$/i,
     /\babraços\b\.?\s*$/i,
@@ -236,9 +281,6 @@ function sanitizeAnswer(text, question) {
     /\btenha um (otimo|ótimo) dia\b\.?\s*$/i,
     /\bate mais\b\.?\s*$/i,
     /\baté mais\b\.?\s*$/i,
-    /\bqualquer coisa\b\.?\s*$/i,
-    /\bqualquer dúvida\b\.?\s*$/i,
-    
   ];
   let changed = true;
   while (changed) {
@@ -249,12 +291,9 @@ function sanitizeAnswer(text, question) {
     if (t !== before) changed = true;
   }
 
-  // remove links se a pergunta não pediu link
   if (!shouldAllowLinks(question)) {
     t = stripLinks(t).replace(/\s+\n/g, "\n").trim();
   }
-
-  // não adiciona frase final automática
   return t.trim();
 }
 
@@ -263,25 +302,18 @@ async function openaiAnswer({ question, retrieved }) {
   const sys = `
 Você é a Liz, assistente do restaurante Tsunagari (WhatsApp).
 
-Tom e estilo:
-- Carinhoso, acolhedor, paciente e educado.
-- Use 1 a 2 emojis leves quando combinar (ex.: 🍣✨🙏😊❤️🍷). Não exagerar.
+Tom:
+- Carinhoso e acolhedor.
+- Use 1 a 2 emojis leves quando combinar (🍣✨🙏😊❤️🍷). Não exagerar.
 - NÃO use o nome do cliente.
-- NÃO comece com saudação ("Olá", "Oi", "Oie") porque já tivemos boas-vindas.
+- NÃO comece com saudação ("Olá", "Oi", "Oie").
+- NÃO finalize com despedidas ("abraços", "até mais", "aproveite o dia").
 
 Conteúdo:
-- Responda exatamente o que o cliente perguntou, sem fugir de assunto.
-- NÃO invente informações; use apenas os trechos fornecidos.
+- Responda SOMENTE o que o cliente perguntou. Não fuja do assunto.
 - NÃO envie links a menos que o cliente peça link.
-
-Follow-up (quando fizer sentido):
-- Em vez de "Quer que eu te envie...?", prefira convite leve:
-  "Temos uma carta de vinhos bem completa — quer dar uma olhada? 🍷✨"
-- Pode usar "é só avisar!" (isso é ok).
-
-Final:
-- NÃO use despedidas tipo "abraços", "até mais", "aproveite seu dia".
-- Pode terminar com uma pergunta curta OU com "é só avisar! 🍷✨" quando for apropriado.
+- Não invente informações; use apenas os trechos fornecidos.
+- Se faltou informação, faça uma pergunta curta e objetiva.
 
 Formato:
 - 1 a 3 linhas curtas, estilo WhatsApp.
@@ -308,7 +340,7 @@ ${context || "(nenhuma informação relevante encontrada)"}
         { role: "system", content: sys },
         { role: "user", content: user },
       ],
-      temperature: 0.2,
+      temperature: 0.25,
     }),
   });
 
@@ -325,6 +357,155 @@ ${context || "(nenhuma informação relevante encontrada)"}
   return sanitizeAnswer(raw, question);
 }
 
+// ===== Reserva parsing =====
+function parseDateToListName(text) {
+  // accepts dd/mm, dd/mm/yy, dd/mm/yyyy
+  const m = text.match(/\b([0-3]?\d)\/([01]?\d)(?:\/(\d{2}|\d{4}))?\b/);
+  if (!m) return null;
+  let dd = m[1].padStart(2, "0");
+  let mm = m[2].padStart(2, "0");
+  let yy = m[3];
+  if (!yy) {
+    // if no year, assume current year (2-digit)
+    const now = new Date();
+    yy = String(now.getFullYear()).slice(-2);
+  } else if (yy.length === 4) {
+    yy = yy.slice(-2);
+  }
+  return `${dd}/${mm}/${yy}`;
+}
+
+function parseTime(text) {
+  const m = text.match(/\b([01]?\d|2[0-3])[:h]([0-5]\d)\b/);
+  if (!m) return null;
+  return `${m[1].padStart(2, "0")}:${m[2]}`;
+}
+
+function parsePeople(text) {
+  const t = normalizeText(text);
+
+  // pattern: "X adultos e Y criancas"
+  const m = t.match(/\b(\d+)\s*adult[oa]s?\b.*?\b(\d+)\s*crianc[ao]s?\b/);
+  if (m) return Number(m[1]) + Number(m[2]);
+
+  // pattern: "para N pessoas"
+  const m2 = t.match(/\b(\d+)\s*(pessoas|pessoa|lugares|lugar)\b/);
+  if (m2) return Number(m2[1]);
+
+  // pattern: last number in message (fallback)
+  const nums = [...t.matchAll(/\b(\d{1,2})\b/g)].map((x) => Number(x[1]));
+  if (nums.length) {
+    // avoid using time hour as people: if time exists, ignore hour
+    const time = parseTime(text);
+    if (time) {
+      const hour = Number(time.split(":")[0]);
+      const filtered = nums.filter((n) => n !== hour);
+      if (filtered.length) return filtered[filtered.length - 1];
+    }
+    return nums[nums.length - 1];
+  }
+
+  return null;
+}
+
+function parseName(text) {
+  // Accept "Nome: X" or "No nome de X"
+  const m = text.match(/nome\s*[:\-]\s*([^\n\r]+)/i);
+  if (m) return m[1].trim();
+  const m2 = text.match(/no nome de\s+([^\n\r]+)/i);
+  if (m2) return m2[1].trim();
+  return null;
+}
+
+function timeToMinutes(hhmm) {
+  const [h, m] = hhmm.split(":").map(Number);
+  return h * 60 + m;
+}
+
+function isTimeAllowed(hhmm) {
+  return timeToMinutes(hhmm) <= timeToMinutes(RESERVA_HORA_MAX);
+}
+
+// ===== Trello helpers =====
+async function trelloGet(url) {
+  const full = new URL(url);
+  full.searchParams.set("key", TRELLO_KEY);
+  full.searchParams.set("token", TRELLO_TOKEN);
+  const r = await fetch(full.toString());
+  const t = await r.text();
+  if (!r.ok) throw new Error(`Trello GET failed ${r.status}: ${t}`);
+  return JSON.parse(t);
+}
+
+async function trelloPost(url, bodyObj) {
+  const full = new URL(url);
+  full.searchParams.set("key", TRELLO_KEY);
+  full.searchParams.set("token", TRELLO_TOKEN);
+  const r = await fetch(full.toString(), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: bodyObj ? JSON.stringify(bodyObj) : undefined,
+  });
+  const t = await r.text();
+  if (!r.ok) throw new Error(`Trello POST failed ${r.status}: ${t}`);
+  return JSON.parse(t);
+}
+
+async function trelloFindListByName(boardId, listName) {
+  const lists = await trelloGet(`https://api.trello.com/1/boards/${boardId}/lists?fields=name,closed&limit=1000`);
+  return (lists || []).find((l) => !l.closed && l.name === listName) || null;
+}
+
+async function trelloEnsureList(boardId, listName) {
+  const found = await trelloFindListByName(boardId, listName);
+  if (found) return found;
+  // create list
+  return await trelloPost(`https://api.trello.com/1/lists?idBoard=${boardId}&name=${encodeURIComponent(listName)}`, null);
+}
+
+function parsePeopleFromCardName(name) {
+  // expected: "Nome - HH:MM - N"
+  const m = (name || "").match(/-\s*(\d{1,2})\s*$/);
+  if (!m) return null;
+  return Number(m[1]);
+}
+
+async function trelloCountList(listId) {
+  const cards = await trelloGet(`https://api.trello.com/1/lists/${listId}/cards?fields=name&limit=1000`);
+  const total = cards.length;
+  const twoP = cards.filter((c) => parsePeopleFromCardName(c.name) === 2).length;
+  return { total, twoP };
+}
+
+async function trelloCreateReservaCard({ listId, nome, hora, pessoas, telefone }) {
+  const title = `${nome} - ${hora} - ${pessoas}`;
+  const desc = `Telefone/WhatsApp: ${telefone}`;
+  return await trelloPost(`https://api.trello.com/1/cards?idList=${listId}`, {
+    name: title,
+    desc,
+  });
+}
+
+// ===== Reserva messages =====
+async function getNotionReservaTemplate(name, fallback) {
+  const t = await notionFindExactByName(NOTION_DB_RESERVAS, name);
+  return (t && t.trim()) ? t.trim() : fallback;
+}
+
+function buildConfirmMessage({ nome, dataList, hora, pessoas }) {
+  // dataList is DD/MM/YY; message uses same (OK)
+  return (
+    `Perfeito! 😊\n` +
+    `Reserva confirmada:\n` +
+    `Nome: ${nome}\n` +
+    `Data: ${dataList}\n` +
+    `Horário: ${hora}\n` +
+    `Pessoas: ${pessoas}\n\n` +
+    `⏰ Tolerância de 15min. Após esse período, a mesa pode ser liberada pra quem estiver aguardando.\n` +
+    `Se precisar alterar ou cancelar, é só avisar! 🍣✨`
+  );
+}
+
 // ===== HTTP server =====
 const server = http.createServer((req, res) => {
   if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
@@ -336,6 +517,7 @@ const server = http.createServer((req, res) => {
   req.on("data", (c) => buf.push(c));
 
   req.on("end", async () => {
+    // ACK rápido pro webhook
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     res.end("OK");
 
@@ -351,6 +533,9 @@ const server = http.createServer((req, res) => {
       must("NOTION_TOKEN", NOTION_TOKEN);
       must("EVOLUTION_SERVER_URL", EVOLUTION_SERVER_URL);
       must("EVOLUTION_APIKEY", EVOLUTION_APIKEY);
+      must("TRELLO_KEY", TRELLO_KEY);
+      must("TRELLO_TOKEN", TRELLO_TOKEN);
+      must("TRELLO_BOARD_ID", TRELLO_BOARD_ID);
 
       if (bodyJson.event !== "messages.upsert") return;
       if (bodyJson?.data?.key?.fromMe) return;
@@ -359,8 +544,11 @@ const server = http.createServer((req, res) => {
       const incomingText = extractIncomingText(bodyJson);
       if (!remoteJid || !incomingText) return;
 
+      const state = loadState();
+
       await ensureKnowledgeFresh();
 
+      // 1) greeting => exact welcome from Notion
       if (looksLikeGreeting(incomingText)) {
         const welcome =
           (await notionFindExactByName(NOTION_DB_RESTAURANTE, NOTION_WELCOME_NAME)) ||
@@ -369,6 +557,121 @@ const server = http.createServer((req, res) => {
         return;
       }
 
+      // 2) If in reservation flow, try to fill fields
+      const existing = getConv(state, remoteJid);
+      const inReservaFlow = existing?.mode === "reserva";
+
+      // 2a) Start reservation flow if intent detected (or already in it)
+      if (looksLikeReservaIntent(incomingText) || inReservaFlow) {
+        const conv = existing && inReservaFlow
+          ? existing
+          : { mode: "reserva", data: {}, startedAt: Date.now() };
+
+        // Extract possible fields from this message
+        const nome = parseName(incomingText);
+        const dataList = parseDateToListName(incomingText);
+        const hora = parseTime(incomingText);
+        const pessoas = parsePeople(incomingText);
+
+        if (nome) conv.data.nome = nome;
+        if (dataList) conv.data.dataList = dataList;
+        if (hora) conv.data.hora = hora;
+        if (pessoas) conv.data.pessoas = pessoas;
+
+        setConv(state, remoteJid, conv);
+
+        // Ask for missing
+        const missing = [];
+        if (!conv.data.nome) missing.push("Nome");
+        if (!conv.data.dataList) missing.push("Data (DD/MM ou DD/MM/AAAA)");
+        if (!conv.data.hora) missing.push("Horário (ex.: 19:30)");
+        if (!conv.data.pessoas) missing.push("Quantidade de pessoas (número)");
+
+        if (missing.length) {
+          const pedir = await getNotionReservaTemplate(
+            "dados para a reserva",
+            "Perfeito! 😊 Pra eu agendar sua reserva, me manda:\n\nNome:\nData:\nHorário:\nQuantidade de pessoas:"
+          );
+
+          // If already started, just remind missing (short)
+          if (inReservaFlow) {
+            await evolutionSendText({
+              remoteJid,
+              text:
+                `Só me confirma rapidinho pra eu fechar sua reserva 😊\n` +
+                `${missing.map((m) => `- ${m}`).join("\n")}`,
+            });
+          } else {
+            await evolutionSendText({ remoteJid, text: pedir });
+          }
+          return;
+        }
+
+        // Validate hour
+        if (!isTimeAllowed(conv.data.hora)) {
+          await evolutionSendText({
+            remoteJid,
+            text:
+              `Consigo fazer reserva para chegada até ${RESERVA_HORA_MAX} (com 15min de tolerância). 😊\n` +
+              `Depois desse horário, pode vir sem reserva mesmo, por ordem de chegada. 🍣✨`,
+          });
+          return;
+        }
+
+        // Trello capacity check
+        const list = await trelloEnsureList(TRELLO_BOARD_ID, conv.data.dataList);
+        const counts = await trelloCountList(list.id);
+
+        const maxTotal = Number(RESERVA_MAX_TOTAL_DIA);
+        const max2p = Number(RESERVA_MAX_2P_DIA);
+
+        if (counts.total >= maxTotal) {
+          const msg = await getNotionReservaTemplate(
+            "limite de reserva(checar trello)",
+            "❗ Já atingimos o limite de reservas para esse dia. Você pode vir sem reserva, por ordem de chegada. 😊"
+          );
+          await evolutionSendText({ remoteJid, text: msg });
+          clearConv(state, remoteJid);
+          return;
+        }
+
+        if (Number(conv.data.pessoas) === 2 && counts.twoP >= max2p) {
+          await evolutionSendText({
+            remoteJid,
+            text:
+              `Hoje já atingimos o limite de reservas para 2 pessoas. 😊\n` +
+              `Mas você pode vir sem reserva por ordem de chegada. 🍣✨`,
+          });
+          clearConv(state, remoteJid);
+          return;
+        }
+
+        // Create card
+        const telefone = remoteJid.split("@")[0];
+        await trelloCreateReservaCard({
+          listId: list.id,
+          nome: conv.data.nome,
+          hora: conv.data.hora,
+          pessoas: conv.data.pessoas,
+          telefone,
+        });
+
+        // Confirm to customer
+        await evolutionSendText({
+          remoteJid,
+          text: buildConfirmMessage({
+            nome: conv.data.nome,
+            dataList: conv.data.dataList,
+            hora: conv.data.hora,
+            pessoas: conv.data.pessoas,
+          }),
+        });
+
+        clearConv(state, remoteJid);
+        return;
+      }
+
+      // 3) General doubts => Notion + OpenAI
       const retrieved = simpleRetrieve(incomingText, KNOWLEDGE, 12);
       const answer = await openaiAnswer({ question: incomingText, retrieved });
       await evolutionSendText({ remoteJid, text: answer });
@@ -385,5 +688,5 @@ const server = http.createServer((req, res) => {
   } catch (e) {
     console.error("initial_load_failed", e?.message || e);
   }
-  server.listen(3000, () => console.log("Tsunagari bot v1 on :3000"));
+  server.listen(3000, () => console.log("Tsunagari bot v2 on :3000"));
 })();
