@@ -3,25 +3,28 @@
  *
  * Inclui:
  * - Reserva: pede dados, valida domingo fechado, valida hora limite (sugere 19:45), cria card no Trello
- * - Nome completo (corrigido) + inferência de nome quando vem tudo junto
+ * - Nome completo + inferência de nome quando vem tudo junto
  * - Adultos/crianças separado (card: "3ad+1c"; confirmação: "3 adultos e 1 criança")
  * - Saudação robusta ("Olá," / "Olá! vim do instagram")
- * - Anti-pergunta boba (pizza/hambúrguer etc) com resposta fixa (sem LLM)
- * - Detecção de "pedido" (pedido/delivery/retirar/ifood etc): avisa você via WhatsApp (ADMIN)
+ * - Anti-pergunta boba (pizza/hambúrguer etc) com resposta fixa
+ * - Detecção de "pedido" (delivery/retirar/ifood etc): avisa ADMIN via WhatsApp
+ * - HANDOFF automático: se alguém do restaurante mandar msg (fromMe=true), o bot PAUSA nessa conversa por X minutos.
+ *   (Sem "bot on". Ele só verifica se está pausado.)
  *
- * ENV obrigatórias (como você já tem):
- * - OPENAI_API_KEY, OPENAI_MODEL
+ * ENV obrigatórias:
+ * - OPENAI_API_KEY
  * - NOTION_TOKEN
  * - EVOLUTION_SERVER_URL, EVOLUTION_APIKEY, EVOLUTION_INSTANCE
  * - TRELLO_KEY, TRELLO_TOKEN, TRELLO_BOARD_ID
  *
  * ENV recomendadas:
  * - PORT
- * - ADMIN_WHATSAPP (ex: "5561999992938")  // número que recebe alertas
- * - RESERVA_HORA_MAX (default 19:45)
- * - RESERVA_MAX_TOTAL_DIA (default 13)
- * - RESERVA_MAX_2P_DIA (default 4)
- * - FECHADO_DOMINGO ("1" default 1)
+ * - ADMIN_WHATSAPP=5561999211921
+ * - HANDOFF_MINUTES=180   // ex. 3h (default 180)
+ * - RESERVA_HORA_MAX=19:45
+ * - RESERVA_MAX_TOTAL_DIA=13
+ * - RESERVA_MAX_2P_DIA=4
+ * - FECHADO_DOMINGO=1
  */
 
 const http = require("http");
@@ -42,6 +45,9 @@ const {
 
   // Admin alerts
   ADMIN_WHATSAPP = "",
+
+  // Handoff (pausa automática quando humano manda msg)
+  HANDOFF_MINUTES = "180",
 
   // Notion
   NOTION_TOKEN,
@@ -156,6 +162,13 @@ function setConv(state, jid, conv) {
 function clearConv(state, jid) {
   delete state.conversations[jid];
   saveState(state);
+}
+
+function setHandoffPause(state, remoteJid, minutes) {
+  const existing = getConv(state, remoteJid) || { mode: null, data: {} };
+  existing.handoffUntil = Date.now() + minutes * 60 * 1000;
+  existing.handoffAt = Date.now();
+  setConv(state, remoteJid, existing);
 }
 
 // ===== Notion =====
@@ -310,13 +323,16 @@ function shouldAllowLinks(question) {
 }
 
 function unmarkdownLinks(t) {
+  // "[cardápio](https://...)" => "https://..."
   return (t || "").replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/gi, "$2");
 }
 
 function stripLinks(text) {
   let t = text || "";
-  t = t.replace(/\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/gi, ""); // remove markdown link whole
-  t = t.replace(/https?:\/\/\S+/gi, ""); // remove raw urls
+  // remove markdown link whole (do not leave "[cardápio]")
+  t = t.replace(/\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/gi, "");
+  // remove raw urls
+  t = t.replace(/https?:\/\/\S+/gi, "");
   return t;
 }
 
@@ -424,12 +440,10 @@ function asksNonJapaneseFood(text) {
 
 function looksLikeOrderIntent(text) {
   const t = normalizeText(text);
-  // gente tentando "pedir comida" no whatsapp
   return (
     /\b(pedido|pedir|quero pedir|vou querer|me ve|me vê|manda|entrega|delivery|retirar|take away|para viagem)\b/.test(
       t
-    ) ||
-    /\b(ifood|i-food|ubereats|uber eats|rappi)\b/.test(t)
+    ) || /\b(ifood|i-food|ubereats|uber eats|rappi)\b/.test(t)
   );
 }
 
@@ -726,14 +740,31 @@ const server = http.createServer((req, res) => {
       must("TRELLO_TOKEN", TRELLO_TOKEN);
       must("TRELLO_BOARD_ID", TRELLO_BOARD_ID);
 
-      if (bodyJson.event !== "messages.upsert") return;
-      if (bodyJson?.data?.key?.fromMe) return;
+      const event = String(bodyJson.event || "").toLowerCase();
+      if (event !== "messages.upsert") return;
 
       const remoteJid = bodyJson?.data?.key?.remoteJid;
+      if (!remoteJid) return;
+
+      // HANDOFF: se humano enviou msg (fromMe=true), pausa essa conversa e não responde
+      if (bodyJson?.data?.key?.fromMe) {
+        const state = loadState();
+        const mins = Math.max(5, Number(HANDOFF_MINUTES || 180));
+        setHandoffPause(state, remoteJid, mins);
+        return;
+      }
+
       const incomingText = extractIncomingText(bodyJson);
-      if (!remoteJid || !incomingText) return;
+      if (!incomingText) return;
 
       const state = loadState();
+
+      // Se conversa está pausada, bot fica quieto
+      const existingPause = getConv(state, remoteJid);
+      if (existingPause?.handoffUntil && existingPause.handoffUntil > Date.now()) {
+        return;
+      }
+
       await ensureKnowledgeFresh();
 
       // (A) Saudação => welcome Notion
@@ -755,8 +786,7 @@ const server = http.createServer((req, res) => {
         return;
       }
 
-      // (C) Tentativa de “fazer pedido” => avisa você + responde cliente
-      // Obs: só dispara fora do fluxo de reserva, pra não confundir
+      // (C) Tentativa de “fazer pedido” => avisa admin + responde cliente
       const existing = getConv(state, remoteJid);
       const inReservaFlow = existing?.mode === "reserva";
 
@@ -768,8 +798,7 @@ const server = http.createServer((req, res) => {
 
         await evolutionSendText({
           remoteJid,
-          text:
-            "Entendi! 😊 Só um instante que vou chamar alguém da equipe pra te ajudar por aqui. 🍣",
+          text: "Entendi! 😊 Só um instante que vou chamar alguém da equipe pra te ajudar por aqui. 🍣",
         });
         return;
       }
@@ -781,7 +810,7 @@ const server = http.createServer((req, res) => {
             ? existing
             : { mode: "reserva", data: {}, startedAt: Date.now() };
 
-        // if we suggested max hour and user confirmed
+        // if suggested max hour and user confirmed
         if (conv?.awaitingHoraMaxConfirm && isAffirmative(incomingText)) {
           conv.data.hora = RESERVA_HORA_MAX;
           conv.awaitingHoraMaxConfirm = false;
@@ -791,7 +820,7 @@ const server = http.createServer((req, res) => {
         const dateObjNow = parseDateBR(incomingText);
         if (dateObjNow) conv.data.dateObj = dateObjNow;
 
-        // Extract fields from this message
+        // extract fields
         const nome = parseNameSmart(incomingText);
         const dataList = parseDateToListName(incomingText);
         const hora = parseTime(incomingText);
@@ -828,7 +857,7 @@ const server = http.createServer((req, res) => {
           return;
         }
 
-        // Missing fields
+        // missing fields
         const missing = [];
         if (!conv.data.nome) missing.push("Nome");
         if (!conv.data.dataList) missing.push("Data (DD/MM ou DD/MM/AAAA)");
@@ -856,7 +885,7 @@ const server = http.createServer((req, res) => {
           return;
         }
 
-        // Validate hour (soft + suggest max)
+        // hour limit (soft)
         if (!isTimeAllowed(conv.data.hora)) {
           const msg = await getNotionReservaTemplate(
             "LIMITE HORARIO de reserva",
