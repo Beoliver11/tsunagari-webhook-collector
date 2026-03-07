@@ -51,20 +51,9 @@ function normalizeText(s) {
 
 function looksLikeGreeting(text) {
   const t = normalizeText(text);
-  return (
-    t === "oi" ||
-    t === "ola" ||
-    t === "oie" ||
-    t === "oiee" ||
-    t === "oieee" ||
-    t === "bom dia" ||
-    t === "boa tarde" ||
-    t === "boa noite" ||
-    t.startsWith("oi ") ||
-    t.startsWith("ola ") ||
-    t.startsWith("oie ")
-  );
+  return /^(oi|ola|oie+|olá, vim pelo instagram|bom dia|boa tarde|boa noite)\b/.test(t);
 }
+
 
 function looksLikeReservaIntent(text) {
   const t = normalizeText(text);
