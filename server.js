@@ -1070,10 +1070,3 @@ const server = http.createServer((req, res) => {
   const PORT = Number(process.env.PORT || 3000);
   server.listen(PORT, () => console.log(`[${nowIso()}] Tsunagari bot v2.1 (domingo-fix) on :${PORT}`));
 })();
-O que muda em relação ao seu arquivo anterior (de propósito, só o necessário pra domingo):
-
-Antes de greeting/FAQ/OpenAI, entra um bloco que detecta “abre hoje?” e:
-se for domingo (timezone SP) e FECHADO_DOMINGO != "0" → responde “hoje não abre”
-senão → responde o horário normal
-loadKnowledge() não inclui mais NOTION_DB_RESERVAS, pra parar de puxar “limite de reservas” em perguntas gerais.
-Se depois disso você quiser, eu ajusto também o greeting (pra “Olá, vocês abrem hoje?” não virar só boas-vindas), mas o seu “problemasso do domingo” fica resolvido aqui.
