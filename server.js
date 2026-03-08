@@ -79,9 +79,40 @@ function normalizeText(s) {
 
 function looksLikeGreeting(text) {
   const t = normalizeText(text);
-  return /^(oi|ola|oie+|bom dia|boa tarde|boa noite)\b/.test(t);
-}
 
+  // se tem "?" já é quase certo que não é só saudação
+  if (t.includes("?")) return false;
+
+  // se tem sinais de intenção/pergunta, não tratar como saudação pura
+  const hasIntent =
+    t.includes("reserva") ||
+    t.includes("mesa") ||
+    t.includes("agendar") ||
+    t.includes("marcar") ||
+    t.includes("horario") ||
+    t.includes("horário") ||
+    t.includes("abre") ||
+    t.includes("abrem") ||
+    t.includes("funciona") ||
+    t.includes("hoje") ||
+    t.includes("amanha") ||
+    t.includes("amanhã") ||
+    t.includes("onde") ||
+    t.includes("endereco") ||
+    t.includes("endereço") ||
+    t.includes("cardapio") ||
+    t.includes("cardápio") ||
+    t.includes("menu") ||
+    t.includes("preco") ||
+    t.includes("preço");
+
+  if (hasIntent) return false;
+
+  // aceita só saudações curtas/“puras”
+  // exemplos que passam: "oi", "ola", "oii", "boa tarde", "ola tudo bem"
+  // exemplos que NÃO passam (pela regra acima): "ola voces abrem hoje"
+  return /^(oi|ola|oie+|bom dia|boa tarde|boa noite)(\b|$)/.test(t) && t.length <= 22;
+}
 /**
  * Intent de reserva mais rígido:
  * NÃO usa “pra amanhã/pra hoje” como gatilho sozinho
