@@ -164,6 +164,29 @@ function weekdaySaoPauloShort() {
   const fmt = new Intl.DateTimeFormat("en-US", { timeZone: "America/Sao_Paulo", weekday: "short" });
   return fmt.format(new Date()).toLowerCase();
 }
+
+function getTodayBRDateObjInSaoPaulo() {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Sao_Paulo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  // en-CA dá YYYY-MM-DD
+  const parts = fmt.format(new Date()).split("-");
+  const yyyy = Number(parts[0]);
+  const mm = Number(parts[1]);
+  const dd = Number(parts[2]);
+  return { dd, mm, yyyy };
+}
+
+function dateObjToDataList(dateObj) {
+  const dd = String(dateObj.dd).padStart(2, "0");
+  const mm = String(dateObj.mm).padStart(2, "0");
+  const yy = String(dateObj.yyyy).slice(-2);
+  return `${dd}/${mm}/${yy}`;
+}
+
 function isSundaySaoPaulo() {
   return weekdaySaoPauloShort() === "sun";
 }
