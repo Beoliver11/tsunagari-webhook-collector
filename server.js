@@ -97,9 +97,17 @@ function normalizeText(s) {
 // saudação robusta: "Olá," "Olá!" "Oi..."
 function looksLikeGreeting(text) {
   const t = normalizeText(text);
+
+  // se tem pergunta/intenção junto, não é saudação pura
+  if (t.includes("?")) return false;
+  if (looksLikeReservaIntent(t)) return false;
+  if (looksLikeOrderIntent(t)) return false;
+
+  // saudação curta
+  if (t.length > 25) return false;
+
   return /^(oi|ola|oie+|bom dia|boa tarde|boa noite)\b/.test(t);
 }
-
 /**
  * FIX IMPORTANTE: Intent de reserva MAIS RÍGIDO
  * - NÃO usa “pra amanhã/pra hoje” como gatilho sozinho
