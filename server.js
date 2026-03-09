@@ -8,6 +8,11 @@
  * - Mantém: FAQ sem poluição de reservas (não usa DB de templates no knowledge)
  * - Mantém: Reserva parcial (hora sem data => assume HOJE SP)
  * - Mantém: Greeting não dispara dentro do fluxo de reserva
+ *
+ * Ajustes aplicados agora:
+ * - (1) parsePeopleTotal: ignora datas (dd/mm[/aaaa]) no fallback numérico
+ * - (2) Cache de templates do Notion (5min)
+ * - (3) looksLikeOrderIntent: evita falso positivo em “manda o cardápio”
  */
 
 const http = require("http");
@@ -18,7 +23,7 @@ const path = require("path");
 const {
   // OpenAI
   OPENAI_API_KEY,
-  OPENAI_MODEL = "gpt-4o-mini",
+  OPENAI_MODEL = "gpt-5.2",
 
   // Evolution
   EVOLUTION_SERVER_URL,
@@ -39,14 +44,14 @@ const {
   // Notion
   NOTION_TOKEN,
 
-  // NOVO (Notion reorganizado)
+  // Notion DBs (novo)
   NOTION_DB_FAQ = "2bf12169-2df7-806a-82cc-d8c1c3e39202", // FAQ (Respostas)
   NOTION_DB_TEMPLATES = "516f3fa8-2a01-473d-ab97-e77c51ab4ae7", // Templates (Mensagens prontas)
   NOTION_DB_REGRAS_SOP = "7501bc29-7b0b-40e5-806c-23b43e56ad40", // Regras (SOP)
   NOTION_DB_LINKS = "9269b2de-6d30-4f64-9f57-64feb7f9a371", // Links & Contatos
   NOTION_DB_CARDAPIO = "", // opcional
 
-  // Antigo (compat): caso você ainda use os DBs antigos (pode remover depois)
+  // Legado (mantido por compat)
   NOTION_WELCOME_NAME = "Mensagem de boas vindas:",
   NOTION_DB_RESTAURANTE = "2bf12169-2df7-806a-82cc-d8c1c3e39202",
   NOTION_DB_POLITICA = "2b512169-2df7-80f2-ab82-c358e0393ace",
@@ -100,16 +105,17 @@ function looksLikeReservaIntent(text) {
     t.includes("marcar")
   );
 }
+
 function looksLikeOrderIntent(text) {
   const t = normalizeText(text);
+  // Evitar falso positivo em frases tipo "manda o cardápio"
   return (
-    /\b(pedido|pedir|quero pedir|vou querer|me ve|me vê|manda|entrega|delivery|retirar|take away|para viagem)\b/.test(
-      t
-    ) || /\b(ifood|i-food|ubereats|uber eats|rappi)\b/.test(t)
+    /\b(pedido|pedir|quero pedir|vou querer|entrega|delivery|retirar|take away|para viagem)\b/.test(t) ||
+    /\b(ifood|i-food|ubereats|uber eats|rappi)\b/.test(t)
   );
 }
+
 function looksLikeGreeting(text) {
-  // Saudação “pura”, curta, e sem intenção junto
   const t = normalizeText(text);
   if (t.includes("?")) return false;
   if (looksLikeReservaIntent(t)) return false;
@@ -117,6 +123,7 @@ function looksLikeGreeting(text) {
   if (t.length > 25) return false;
   return /^(oi|ola|oie+|bom dia|boa tarde|boa noite)\b/.test(t);
 }
+
 function isAffirmative(text) {
   const t = normalizeText(text);
   return (
@@ -134,6 +141,7 @@ function isAffirmative(text) {
     t === "confirmado"
   );
 }
+
 function extractIncomingText(bodyJson) {
   const msg = bodyJson?.data?.message || {};
   return (
@@ -144,16 +152,14 @@ function extractIncomingText(bodyJson) {
     ""
   ).trim();
 }
+
 function getIncomingMessageId(bodyJson) {
   return bodyJson?.data?.key?.id || bodyJson?.data?.messageId || bodyJson?.data?.id || "";
 }
 
 // ===== FIX domingo: “abre hoje?” determinístico (timezone SP) =====
 function weekdaySaoPauloShort() {
-  const fmt = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/Sao_Paulo",
-    weekday: "short",
-  });
+  const fmt = new Intl.DateTimeFormat("en-US", { timeZone: "America/Sao_Paulo", weekday: "short" });
   return fmt.format(new Date()).toLowerCase(); // sun|mon|...
 }
 function isSundaySaoPaulo() {
@@ -247,7 +253,6 @@ function notionTextFromProp(prop) {
   if (prop.type === "select") return prop.select?.name || "";
   return "";
 }
-
 function notionPickProp(page, candidates) {
   const props = page?.properties || {};
   for (const key of candidates) {
@@ -259,7 +264,6 @@ function notionPickProp(page, candidates) {
 async function notionQueryAllRowsFlexible(dbId, pageSize = 100) {
   let cursor = undefined;
   const rows = [];
-
   for (let i = 0; i < 20; i++) {
     const body = { page_size: pageSize };
     if (cursor) body.start_cursor = cursor;
@@ -278,7 +282,6 @@ async function notionQueryAllRowsFlexible(dbId, pageSize = 100) {
     if (!r.ok) throw new Error(`Notion query failed ${r.status}: ${JSON.stringify(j)}`);
 
     for (const p of j.results || []) {
-      // Suporta DB antigo (Nome/Texto) e novo (Título/Resposta/...)
       const titleProp = notionPickProp(p, ["Título", "Titulo", "Nome", "Nome do template", "Name"]);
       const textProp = notionPickProp(p, ["Resposta", "Texto", "Mensagem", "Valor", "Text"]);
       const catProp = notionPickProp(p, ["Categoria", "Tipo"]);
@@ -298,7 +301,6 @@ async function notionQueryAllRowsFlexible(dbId, pageSize = 100) {
     if (!j.has_more) break;
     cursor = j.next_cursor;
   }
-
   return rows;
 }
 
@@ -316,7 +318,6 @@ async function notionFindExactTextByTitleFlexible(dbId, title, { textPropCandida
     }),
   });
 
-  // Se o DB novo não tem propriedade "Nome", a query acima falha. Vamos fazer fallback sem filtro.
   const j = await r.json().catch(() => ({}));
   if (!r.ok) {
     const rows = await notionQueryAllRowsFlexible(dbId, 100);
@@ -335,6 +336,34 @@ async function notionFindExactTextByTitleFlexible(dbId, title, { textPropCandida
 let KNOWLEDGE = [];
 let lastLoadAt = 0;
 
+let TEMPLATE_CACHE = new Map();
+let lastTemplatesLoadAt = 0;
+
+async function loadTemplates() {
+  if (!NOTION_DB_TEMPLATES) {
+    TEMPLATE_CACHE = new Map();
+    lastTemplatesLoadAt = Date.now();
+    return;
+  }
+  const rows = await notionQueryAllRowsFlexible(NOTION_DB_TEMPLATES);
+  const m = new Map();
+  for (const r of rows) {
+    if (r.ativo === false) continue;
+    const key = String(r.name || "").trim();
+    const val = String(r.text || "").trim();
+    if (!key || !val) continue;
+    m.set(normalizeText(key), val);
+  }
+  TEMPLATE_CACHE = m;
+  lastTemplatesLoadAt = Date.now();
+  console.log(`[${nowIso()}] Templates loaded: ${TEMPLATE_CACHE.size}`);
+}
+
+async function ensureTemplatesFresh() {
+  const maxAgeMs = 5 * 60 * 1000;
+  if (Date.now() - lastTemplatesLoadAt > maxAgeMs) await loadTemplates();
+}
+
 async function loadKnowledge() {
   const all = [];
 
@@ -352,12 +381,7 @@ async function loadKnowledge() {
         all.push({ ...r, db: "cardapio" });
       }
     }
-
-    // Regras SOP NÃO entram no knowledge (lógica interna)
-    // Templates NÃO entram no knowledge (pra não poluir)
-    // Links também não
   } else {
-    // Legado
     const dbs = [
       { name: "restaurante", id: NOTION_DB_RESTAURANTE },
       { name: "politica", id: NOTION_DB_POLITICA },
@@ -426,12 +450,6 @@ async function notifyHumans(text) {
   }
 }
 
-/**
- * Handoff inteligente:
- * - chama humanos (HUMAN_NUMBERS + ADMIN_WHATSAPP)
- * - manda msg pro cliente
- * - NÃO pausa o chat (pause continua sendo só via fromMe=true)
- */
 async function handoffToHuman({ state, remoteJid, reason, incomingText }) {
   const from = remoteJid.split("@")[0];
   await evolutionSendText({
@@ -451,7 +469,6 @@ function simpleRetrieve(question, knowledgeRows, k = 12) {
   const scored = [];
 
   for (const row of knowledgeRows) {
-    // inclui categoria/keywords pra ajudar o retrieve
     const hay = normalizeText(`${row.name} ${row.categoria || ""} ${row.keywords || ""} ${row.text || ""}`);
     let score = 0;
     for (const w of qWords) if (hay.includes(w)) score++;
@@ -678,9 +695,8 @@ function looksLikeStandaloneName(text) {
 }
 
 /**
- * NOVO: extrai e SOMA total de pessoas.
- * - entende adulto(s), criança(s), adolescente(s), bebê(s)
- * - se não vier por categoria, cai no fallback "X pessoas"
+ * Pessoas: soma total (adultos + crianças + adolescentes + bebês).
+ * Fix: no fallback numérico, ignora datas dd/mm[/aaaa]
  */
 function parsePeopleTotal(text) {
   const t = normalizeText(text);
@@ -704,17 +720,17 @@ function parsePeopleTotal(text) {
 
   if (matchedAny) return sum;
 
-  // fallback: "X pessoas/lugares"
   const m2 = t.match(/\b(\d+)\s*(pessoas|pessoa|lugares|lugar)\b/);
   if (m2) return Number(m2[1]);
 
-  // fallback: último número (evitando confundir com hora)
-  const nums = [...t.matchAll(/\b(\d{1,2})\b/g)].map((x) => Number(x[1]));
+  // remove datas antes de pegar números soltos
+  const noDates = t.replace(/\b[0-3]?\d\/[01]?\d(?:\/\d{2,4})?\b/g, " ");
+  const nums = [...noDates.matchAll(/\b(\d{1,2})\b/g)].map((x) => Number(x[1]));
   if (nums.length) {
     const time = parseTime(text);
     if (time) {
       const hour = Number(time.split(":")[0]);
-      const filtered = nums.filter((n) => n !== hour);
+      const filtered = nums.filter((n) => n != hour);
       if (filtered.length) return filtered[filtered.length - 1];
     }
     return nums[nums.length - 1];
@@ -773,9 +789,7 @@ async function trelloPost(url, bodyObj) {
   return JSON.parse(t);
 }
 async function trelloFindListByName(boardId, listName) {
-  const lists = await trelloGet(
-    `https://api.trello.com/1/boards/${boardId}/lists?fields=name,closed&limit=1000`
-  );
+  const lists = await trelloGet(`https://api.trello.com/1/boards/${boardId}/lists?fields=name,closed&limit=1000`);
   return (lists || []).find((l) => !l.closed && l.name === listName) || null;
 }
 async function trelloEnsureList(boardId, listName) {
@@ -786,27 +800,21 @@ async function trelloEnsureList(boardId, listName) {
     null
   );
 }
-
 function parsePeopleFromCardName(name) {
-  // novo formato esperado: "- 8p" ou "- 8"
   const m = (name || "").match(/-\s*(\d{1,2})\s*p\b/i);
   if (m) return Number(m[1]);
   const m2 = (name || "").match(/-\s*(\d{1,2})\s*$/);
   if (m2) return Number(m2[1]);
-
-  // legado: "- 2ad+1c"
   const m3 = (name || "").match(/-\s*(\d{1,2})\s*ad\+\s*(\d{1,2})\s*c\s*$/i);
   if (m3) return Number(m3[1]) + Number(m3[2]);
   return null;
 }
-
 async function trelloCountList(listId) {
   const cards = await trelloGet(`https://api.trello.com/1/lists/${listId}/cards?fields=name&limit=1000`);
   const total = cards.length;
   const twoP = cards.filter((c) => parsePeopleFromCardName(c.name) === 2).length;
   return { total, twoP };
 }
-
 async function trelloCreateReservaCard({ listId, nome, hora, pessoasTotal, telefone }) {
   const pessoasLabel = `${Number(pessoasTotal)}p`;
   const title = `${nome} - ${hora} - ${pessoasLabel}`;
@@ -816,15 +824,13 @@ async function trelloCreateReservaCard({ listId, nome, hora, pessoasTotal, telef
 
 // ===== Templates (Notion) =====
 async function getTemplate(templateKey, fallback) {
-  // Novo: DB templates
   if (NOTION_DB_TEMPLATES) {
-    const t = await notionFindExactTextByTitleFlexible(NOTION_DB_TEMPLATES, templateKey, {
-      textPropCandidates: ["Mensagem", "Texto", "Resposta"],
-    });
-    return t && t.trim() ? t.trim() : fallback;
+    await ensureTemplatesFresh();
+    const hit = TEMPLATE_CACHE.get(normalizeText(templateKey));
+    if (hit && hit.trim()) return hit.trim();
+    return fallback;
   }
 
-  // Legado: DB reservas como templates
   const t = await notionFindExactTextByTitleFlexible(NOTION_DB_RESERVAS, templateKey, {
     textPropCandidates: ["Texto"],
   });
@@ -931,6 +937,9 @@ async function handleWebhook(bodyJson) {
 
   await ensureKnowledgeFresh();
 
+  // Templates cache
+  await ensureTemplatesFresh();
+
   // FIX domingo “abre hoje?”
   if (looksLikeOpenTodayQuestion(incomingText)) {
     if (FECHADO_DOMINGO !== "0" && isSundaySaoPaulo()) {
@@ -954,20 +963,10 @@ async function handleWebhook(bodyJson) {
 
   // Greeting (SÓ se NÃO estiver em reserva)
   if (!inReservaFlow && looksLikeGreeting(incomingText)) {
-    let welcome = null;
-    if (NOTION_DB_TEMPLATES) {
-      welcome = await getTemplate("BOAS_VINDAS", "");
-    }
-    if (!welcome) {
-      welcome = await notionFindExactTextByTitleFlexible(NOTION_DB_RESTAURANTE, NOTION_WELCOME_NAME, {
-        textPropCandidates: ["Texto"],
-      });
-    }
+    const welcome = await getTemplate("BOAS_VINDAS", "") ||
+      "Oieeee❤️ Aqui é a Liz! Assistente do Tsunagari. Conte comigo!";
 
-    await evolutionSendText({
-      remoteJid,
-      text: welcome || "Oieeee❤️ Aqui é a Liz! Assistente do Tsunagari. Conte comigo!",
-    });
+    await evolutionSendText({ remoteJid, text: welcome });
     markBotReplied(state, remoteJid);
     return;
   }
@@ -998,7 +997,6 @@ async function handleWebhook(bodyJson) {
   if (looksLikeReservaIntent(incomingText) || inReservaFlow) {
     const conv = existing && inReservaFlow ? existing : { mode: "reserva", data: {}, startedAt: Date.now() };
 
-    // Se está esperando confirmação do limite e cliente insiste em horário impossível => handoff
     if (conv?.awaitingHoraMaxConfirm && !isAffirmative(incomingText)) {
       const tNew = parseTime(incomingText);
       const insisted = looksLikeInsistence(incomingText) || (tNew && !isTimeAllowed(tNew));
@@ -1014,17 +1012,14 @@ async function handleWebhook(bodyJson) {
       }
     }
 
-    // confirmar hora max
     if (conv?.awaitingHoraMaxConfirm && isAffirmative(incomingText)) {
       conv.data.hora = RESERVA_HORA_MAX;
       conv.awaitingHoraMaxConfirm = false;
     }
 
-    // parse date object
     const dateObjNow = parseDateBR(incomingText);
     if (dateObjNow) conv.data.dateObj = dateObjNow;
 
-    // fields
     const nomeSmart = parseNameSmart(incomingText);
     const dataList = parseDateToListName(incomingText);
     const hora = parseTime(incomingText);
@@ -1034,14 +1029,12 @@ async function handleWebhook(bodyJson) {
     if (dataList) conv.data.dataList = dataList;
     if (hora) conv.data.hora = hora;
 
-    // Reserva parcial: se tem hora e não tem data => assumir HOJE (SP)
     if (!conv.data.dataList && conv.data.hora) {
       const todayObj = getTodayBRDateObjInSaoPaulo();
       conv.data.dateObj = todayObj;
       conv.data.dataList = dateObjToDataList(todayObj);
     }
 
-    // nome “solto” dentro do fluxo de reserva
     if (!conv.data.nome && looksLikeStandaloneName(incomingText)) {
       conv.data.nome = incomingText.trim();
     }
@@ -1050,7 +1043,6 @@ async function handleWebhook(bodyJson) {
 
     setConv(state, remoteJid, conv);
 
-    // date validations
     if (conv.data.dateObj) {
       if (FECHADO_DOMINGO !== "0" && isSundayBR(conv.data.dateObj)) {
         await evolutionSendText({
@@ -1081,7 +1073,6 @@ async function handleWebhook(bodyJson) {
       }
     }
 
-    // missing
     const missing = [];
     if (!conv.data.nome) missing.push("Nome");
     if (!conv.data.dataList) missing.push("Data (DD/MM ou DD/MM/AAAA)");
@@ -1110,7 +1101,6 @@ async function handleWebhook(bodyJson) {
       return;
     }
 
-    // hour limit
     if (!isTimeAllowed(conv.data.hora)) {
       const msg = await getTemplate(
         "RESERVA_SUGERIR_HORARIO_LIMITE",
@@ -1123,7 +1113,6 @@ async function handleWebhook(bodyJson) {
       return;
     }
 
-    // Trello capacity
     const list = await trelloEnsureList(TRELLO_BOARD_ID, conv.data.dataList);
     const counts = await trelloCountList(list.id);
     const maxTotal = Number(RESERVA_MAX_TOTAL_DIA);
@@ -1151,7 +1140,6 @@ async function handleWebhook(bodyJson) {
       return;
     }
 
-    // Create card
     const telefone = remoteJid.split("@")[0];
     await trelloCreateReservaCard({
       listId: list.id,
@@ -1161,7 +1149,6 @@ async function handleWebhook(bodyJson) {
       telefone,
     });
 
-    // Confirm
     const confirmMsg = await buildConfirmMessageFromNotionOrFallback({
       nome: conv.data.nome,
       dataList: conv.data.dataList,
@@ -1192,7 +1179,6 @@ const server = http.createServer((req, res) => {
   let buf = [];
   req.on("data", (c) => buf.push(c));
   req.on("end", async () => {
-    // ACK rápido pro webhook
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     res.end("OK");
 
@@ -1212,7 +1198,10 @@ const server = http.createServer((req, res) => {
         const remoteJid = bodyJson?.data?.key?.remoteJid || "";
         const incomingText = extractIncomingText(bodyJson);
         await notifyAdmin(
-          `🚨 ERRO no bot jid: ${remoteJid.split("@")[0] || "(?)"} msg: ${incomingText || "(sem texto)"} err: ${msg.slice(0, 800)}`
+          `🚨 ERRO no bot jid: ${remoteJid.split("@")[0] || "(?)"} msg: ${incomingText || "(sem texto)"} err: ${msg.slice(
+            0,
+            800
+          )}`
         );
       } catch {}
     }
@@ -1223,6 +1212,7 @@ const server = http.createServer((req, res) => {
 (async () => {
   try {
     await loadKnowledge();
+    await loadTemplates();
   } catch (e) {
     console.error(`[${nowIso()}] initial_load_failed`, e?.message || e);
   }
