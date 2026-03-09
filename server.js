@@ -1,15 +1,13 @@
 /**
  * Tsunagari WhatsApp Bot (Evolution + Notion + Trello + OpenAI) — “produção”
  *
- * Atualizações incluídas:
- * - FIX domingo / “abre hoje?” por regra (America/Sao_Paulo), sem OpenAI
- * - FAQ sem poluição de reservas: NÃO carrega NOTION_DB_RESERVAS no KNOWLEDGE
- * - Reserva parcial: se cliente pedir reserva e informar horário (mas não data) => assume data=HOJE (SP)
- * - Greeting não dispara dentro do fluxo de reserva
- * - Handoff inteligente (assunto delicado / insistência em horário impossível):
- *    - manda msg pro cliente + alerta para HUMAN_NUMBERS (+ ADMIN_WHATSAPP)
- *    - NÃO pausa o chat (pause continua sendo só via fromMe=true)
- * - Assunto delicado fura throttle (sempre chama humano)
+ * Ajustes (mar/2026):
+ * - Notion reorganizado: FAQ / Templates / Regras / Links
+ * - Pessoas na reserva: salvar APENAS total (inclui adultos+crianças+adolescentes+bebê)
+ * - Mantém FIX domingo / “abre hoje?” determinístico (America/Sao_Paulo)
+ * - Mantém: FAQ sem poluição de reservas (não usa DB de templates no knowledge)
+ * - Mantém: Reserva parcial (hora sem data => assume HOJE SP)
+ * - Mantém: Greeting não dispara dentro do fluxo de reserva
  */
 
 const http = require("http");
@@ -40,14 +38,22 @@ const {
 
   // Notion
   NOTION_TOKEN,
+
+  // NOVO (Notion reorganizado)
+  NOTION_DB_FAQ = "2bf12169-2df7-806a-82cc-d8c1c3e39202", // FAQ (Respostas)
+  NOTION_DB_TEMPLATES = "516f3fa8-2a01-473d-ab97-e77c51ab4ae7", // Templates (Mensagens prontas)
+  NOTION_DB_REGRAS_SOP = "7501bc29-7b0b-40e5-806c-23b43e56ad40", // Regras (SOP)
+  NOTION_DB_LINKS = "9269b2de-6d30-4f64-9f57-64feb7f9a371", // Links & Contatos
+  NOTION_DB_CARDAPIO = "", // opcional
+
+  // Antigo (compat): caso você ainda use os DBs antigos (pode remover depois)
   NOTION_WELCOME_NAME = "Mensagem de boas vindas:",
   NOTION_DB_RESTAURANTE = "2bf12169-2df7-806a-82cc-d8c1c3e39202",
   NOTION_DB_POLITICA = "2b512169-2df7-80f2-ab82-c358e0393ace",
   NOTION_DB_PRECOS = "2b512169-2df7-8065-84c2-ea856c101a2d",
   NOTION_DB_PROMOCOES = "2b512169-2df7-8005-b897-d229a7c10f32",
-  NOTION_DB_RESERVAS = "2b412169-2df7-80c8-ab03-fcd7af2b673e",
+  NOTION_DB_RESERVAS = "2b412169-2df7-80c8-ab03-fcd7af2b673e", // legado
   NOTION_DB_REGRAS = "2b512169-2df7-804d-a6ed-f7417e299ef5",
-  NOTION_DB_CARDAPIO = "",
 
   // Trello
   TRELLO_KEY,
@@ -94,7 +100,6 @@ function looksLikeReservaIntent(text) {
     t.includes("marcar")
   );
 }
-
 function looksLikeOrderIntent(text) {
   const t = normalizeText(text);
   return (
@@ -103,7 +108,6 @@ function looksLikeOrderIntent(text) {
     ) || /\b(ifood|i-food|ubereats|uber eats|rappi)\b/.test(t)
   );
 }
-
 function looksLikeGreeting(text) {
   // Saudação “pura”, curta, e sem intenção junto
   const t = normalizeText(text);
@@ -113,7 +117,6 @@ function looksLikeGreeting(text) {
   if (t.length > 25) return false;
   return /^(oi|ola|oie+|bom dia|boa tarde|boa noite)\b/.test(t);
 }
-
 function isAffirmative(text) {
   const t = normalizeText(text);
   return (
@@ -131,7 +134,6 @@ function isAffirmative(text) {
     t === "confirmado"
   );
 }
-
 function extractIncomingText(bodyJson) {
   const msg = bodyJson?.data?.message || {};
   return (
@@ -142,14 +144,16 @@ function extractIncomingText(bodyJson) {
     ""
   ).trim();
 }
-
 function getIncomingMessageId(bodyJson) {
   return bodyJson?.data?.key?.id || bodyJson?.data?.messageId || bodyJson?.data?.id || "";
 }
 
 // ===== FIX domingo: “abre hoje?” determinístico (timezone SP) =====
 function weekdaySaoPauloShort() {
-  const fmt = new Intl.DateTimeFormat("en-US", { timeZone: "America/Sao_Paulo", weekday: "short" });
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Sao_Paulo",
+    weekday: "short",
+  });
   return fmt.format(new Date()).toLowerCase(); // sun|mon|...
 }
 function isSundaySaoPaulo() {
@@ -171,7 +175,6 @@ function looksLikeSensitiveTopic(text) {
     t
   );
 }
-
 function looksLikeInsistence(text) {
   const t = normalizeText(text);
   return /\b(insisto|tem como|não tem como|nao tem como|por favor|mas eu|mas preciso|eu preciso)\b/.test(t);
@@ -179,7 +182,6 @@ function looksLikeInsistence(text) {
 
 // ======== Persistent state (file) ========
 const STATE_PATH = path.join(process.cwd(), "state.json");
-
 function loadState() {
   try {
     return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
@@ -201,7 +203,6 @@ function clearConv(state, jid) {
   delete state.conversations[jid];
   saveState(state);
 }
-
 function setHandoffPause(state, remoteJid, minutes) {
   const existing = getConv(state, remoteJid) || { mode: null, data: {} };
   existing.handoffUntil = Date.now() + minutes * 60 * 1000;
@@ -210,20 +211,17 @@ function setHandoffPause(state, remoteJid, minutes) {
   existing.data = existing.data || {};
   setConv(state, remoteJid, existing);
 }
-
 function shouldThrottle(existingConv) {
   const cooldown = Math.max(0, Number(COOLDOWN_MS || 0));
   if (!cooldown) return false;
   const last = Number(existingConv?.lastBotReplyAt || 0);
   return Date.now() - last < cooldown;
 }
-
 function markBotReplied(state, remoteJid) {
   const c = getConv(state, remoteJid) || { mode: null, data: {} };
   c.lastBotReplyAt = Date.now();
   setConv(state, remoteJid, c);
 }
-
 function isDuplicateAndMark(state, remoteJid, msgId) {
   if (!msgId) return false;
   const ttl = Math.max(60_000, Number(DEDUPE_TTL_MS || 600_000));
@@ -242,12 +240,30 @@ function isDuplicateAndMark(state, remoteJid, msgId) {
 }
 
 // ===== Notion =====
-async function notionQueryAllRows(dbId, pageSize = 100) {
+function notionTextFromProp(prop) {
+  if (!prop) return "";
+  if (prop.type === "title") return (prop.title || []).map((t) => t.plain_text).join("");
+  if (prop.type === "rich_text") return (prop.rich_text || []).map((t) => t.plain_text).join("");
+  if (prop.type === "select") return prop.select?.name || "";
+  return "";
+}
+
+function notionPickProp(page, candidates) {
+  const props = page?.properties || {};
+  for (const key of candidates) {
+    if (props[key]) return props[key];
+  }
+  return null;
+}
+
+async function notionQueryAllRowsFlexible(dbId, pageSize = 100) {
   let cursor = undefined;
   const rows = [];
+
   for (let i = 0; i < 20; i++) {
     const body = { page_size: pageSize };
     if (cursor) body.start_cursor = cursor;
+
     const r = await fetch(`https://api.notion.com/v1/databases/${dbId}/query`, {
       method: "POST",
       headers: {
@@ -257,23 +273,36 @@ async function notionQueryAllRows(dbId, pageSize = 100) {
       },
       body: JSON.stringify(body),
     });
+
     const j = await r.json();
     if (!r.ok) throw new Error(`Notion query failed ${r.status}: ${JSON.stringify(j)}`);
+
     for (const p of j.results || []) {
-      const name = p.properties?.Nome?.title?.map((t) => t.plain_text).join("") || "";
-      const text = p.properties?.Texto?.rich_text?.map((t) => t.plain_text).join("") || "";
-      const nm = name.trim();
-      const tx = text.trim();
-      if (!nm && !tx) continue;
-      rows.push({ name: nm, text: tx });
+      // Suporta DB antigo (Nome/Texto) e novo (Título/Resposta/...)
+      const titleProp = notionPickProp(p, ["Título", "Titulo", "Nome", "Nome do template", "Name"]);
+      const textProp = notionPickProp(p, ["Resposta", "Texto", "Mensagem", "Valor", "Text"]);
+      const catProp = notionPickProp(p, ["Categoria", "Tipo"]);
+      const kwProp = notionPickProp(p, ["Palavras-chave", "Palavras chave", "Palavras_chave", "Keywords"]);
+      const activeProp = notionPickProp(p, ["Ativo", "Ativa", "Active"]);
+
+      const name = notionTextFromProp(titleProp).trim();
+      const text = notionTextFromProp(textProp).trim();
+      const categoria = notionTextFromProp(catProp).trim();
+      const keywords = notionTextFromProp(kwProp).trim();
+      const ativo = activeProp?.type === "checkbox" ? Boolean(activeProp.checkbox) : true;
+
+      if (!name && !text) continue;
+      rows.push({ name, text, categoria, keywords, ativo });
     }
+
     if (!j.has_more) break;
     cursor = j.next_cursor;
   }
+
   return rows;
 }
 
-async function notionFindExactByName(dbId, name) {
+async function notionFindExactTextByTitleFlexible(dbId, title, { textPropCandidates } = {}) {
   const r = await fetch(`https://api.notion.com/v1/databases/${dbId}/query`, {
     method: "POST",
     headers: {
@@ -283,14 +312,22 @@ async function notionFindExactByName(dbId, name) {
     },
     body: JSON.stringify({
       page_size: 10,
-      filter: { property: "Nome", title: { equals: name } },
+      filter: { property: "Nome", title: { equals: title } },
     }),
   });
-  const j = await r.json();
-  if (!r.ok) throw new Error(`Notion query failed ${r.status}: ${JSON.stringify(j)}`);
+
+  // Se o DB novo não tem propriedade "Nome", a query acima falha. Vamos fazer fallback sem filtro.
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const rows = await notionQueryAllRowsFlexible(dbId, 100);
+    const hit = rows.find((x) => normalizeText(x.name) === normalizeText(title));
+    return hit?.text?.trim() || null;
+  }
+
   const page = j.results?.[0];
   if (!page) return null;
-  const text = page.properties?.Texto?.rich_text?.map((t) => t.plain_text).join("") || "";
+  const prop = notionPickProp(page, textPropCandidates || ["Texto", "Resposta", "Mensagem", "Valor"]);
+  const text = notionTextFromProp(prop);
   return text.trim() || null;
 }
 
@@ -299,21 +336,43 @@ let KNOWLEDGE = [];
 let lastLoadAt = 0;
 
 async function loadKnowledge() {
-  // NÃO incluir NOTION_DB_RESERVAS aqui
-  const dbs = [
-    { name: "restaurante", id: NOTION_DB_RESTAURANTE },
-    { name: "politica", id: NOTION_DB_POLITICA },
-    { name: "precos", id: NOTION_DB_PRECOS },
-    { name: "promocoes", id: NOTION_DB_PROMOCOES },
-    { name: "regras", id: NOTION_DB_REGRAS },
-  ];
-  if (NOTION_DB_CARDAPIO) dbs.push({ name: "cardapio", id: NOTION_DB_CARDAPIO });
-
   const all = [];
-  for (const db of dbs) {
-    const rows = await notionQueryAllRows(db.id);
-    for (const r of rows) all.push({ ...r, db: db.name });
+
+  if (NOTION_DB_FAQ) {
+    const rows = await notionQueryAllRowsFlexible(NOTION_DB_FAQ);
+    for (const r of rows) {
+      if (r.ativo === false) continue;
+      all.push({ ...r, db: "faq" });
+    }
+
+    if (NOTION_DB_CARDAPIO) {
+      const card = await notionQueryAllRowsFlexible(NOTION_DB_CARDAPIO);
+      for (const r of card) {
+        if (r.ativo === false) continue;
+        all.push({ ...r, db: "cardapio" });
+      }
+    }
+
+    // Regras SOP NÃO entram no knowledge (lógica interna)
+    // Templates NÃO entram no knowledge (pra não poluir)
+    // Links também não
+  } else {
+    // Legado
+    const dbs = [
+      { name: "restaurante", id: NOTION_DB_RESTAURANTE },
+      { name: "politica", id: NOTION_DB_POLITICA },
+      { name: "precos", id: NOTION_DB_PRECOS },
+      { name: "promocoes", id: NOTION_DB_PROMOCOES },
+      { name: "regras", id: NOTION_DB_REGRAS },
+    ];
+    if (NOTION_DB_CARDAPIO) dbs.push({ name: "cardapio", id: NOTION_DB_CARDAPIO });
+
+    for (const db of dbs) {
+      const rows = await notionQueryAllRowsFlexible(db.id);
+      for (const r of rows) all.push({ ...r, db: db.name });
+    }
   }
+
   KNOWLEDGE = all;
   lastLoadAt = Date.now();
   console.log(`[${nowIso()}] Knowledge loaded: ${KNOWLEDGE.length} rows`);
@@ -375,21 +434,13 @@ async function notifyHumans(text) {
  */
 async function handoffToHuman({ state, remoteJid, reason, incomingText }) {
   const from = remoteJid.split("@")[0];
-
   await evolutionSendText({
     remoteJid,
     text: "Entendi. Só um instante que vou chamar alguém da equipe pra te ajudar direitinho por aqui. 🙏",
   });
-
-  const alert =
-    `🙋 ATENDIMENTO HUMANO\n` +
-    `Motivo: ${reason}\n` +
-    `Cliente: ${from}\n` +
-    `Mensagem: ${incomingText}`;
-
+  const alert = `🙋 ATENDIMENTO HUMANO Motivo: ${reason} Cliente: ${from} Mensagem: ${incomingText}`;
   await notifyHumans(alert);
   await notifyAdmin(alert);
-
   markBotReplied(state, remoteJid);
 }
 
@@ -398,8 +449,10 @@ function simpleRetrieve(question, knowledgeRows, k = 12) {
   const q = normalizeText(question);
   const qWords = new Set(q.split(" ").filter((w) => w.length >= 3));
   const scored = [];
+
   for (const row of knowledgeRows) {
-    const hay = normalizeText(row.name + " " + row.text);
+    // inclui categoria/keywords pra ajudar o retrieve
+    const hay = normalizeText(`${row.name} ${row.categoria || ""} ${row.keywords || ""} ${row.text || ""}`);
     let score = 0;
     for (const w of qWords) if (hay.includes(w)) score++;
     if (score > 0) scored.push({ score, row });
@@ -439,7 +492,6 @@ function sanitizeAnswer(text, question) {
     /^(oi|ol[aá]|oie+)\s*[!,.:;\-–—]*\s*(?:[A-Za-zÀ-ÿ0-9_.-]{2,30})?\s*[!,.:;\-–—]*\s*/i,
     ""
   );
-
   const closings = [
     /\babracos\b\.?\s*$/i,
     /\babraços\b\.?\s*$/i,
@@ -456,10 +508,8 @@ function sanitizeAnswer(text, question) {
     t = t.trim();
     if (t !== before) changed = true;
   }
-
   if (shouldAllowLinks(question)) t = unmarkdownLinks(t);
   else t = stripLinks(t);
-
   t = t.replace(/[ \t]+ /g, " ").replace(/ {3,}/g, " ").trim();
   return t.trim();
 }
@@ -473,21 +523,21 @@ Tom:
 - Use 1 a 2 emojis leves quando combinar (🍣✨🙏😊❤️🍷). Não exagerar.
 - NÃO use o nome do cliente.
 - NÃO comece com saudação ("Olá", "Oi", "Oie").
-- NÃO finalize com despedidas ("abraços", "até mais", "aproveite o dia").
+- NÃO finalize com despedidas.
 Conteúdo:
-- Responda SOMENTE o que o cliente perguntou. Não fuja do assunto.
+- Responda SOMENTE o que o cliente perguntou.
 - NÃO envie links a menos que o cliente peça link.
 - Não invente informações; use apenas os trechos fornecidos.
 - Se faltou informação, faça uma pergunta curta e objetiva.
 Formato:
 - 1 a 3 linhas curtas, estilo WhatsApp.
-`.trim();
+  `.trim();
 
-  const context = retrieved.map((r, i) => `[#${i + 1}] (${r.db}) ${r.name} ${r.text}`).join(" ");
-  const user = `
-Pergunta do cliente: ${question}
-Trechos do Notion: ${context || "(nenhuma informação relevante encontrada)"}
-`.trim();
+  const context = (retrieved || [])
+    .map((r, i) => `[#${i + 1}] (${r.db}) ${r.name} ${r.text}`)
+    .join(" ");
+
+  const user = `Pergunta do cliente: ${question}\nTrechos do Notion: ${context || "(nenhuma informação relevante encontrada)"}`;
 
   const r = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -540,22 +590,27 @@ function parseDateBR(text) {
   if (!m) return null;
   const dd = Number(m[1]);
   const mm = Number(m[2]);
-  const yyyy = m[3] ? Number(m[3].length === 2 ? "20" + m[3] : m[3]) : new Date().getFullYear();
+  const yyyy = m[3]
+    ? Number(m[3].length === 2 ? "20" + m[3] : m[3])
+    : new Date().getFullYear();
   return { dd, mm, yyyy };
 }
 
 function dateBRToUTCDate({ dd, mm, yyyy }) {
   return new Date(Date.UTC(yyyy, mm - 1, dd, 0, 0, 0));
 }
+
 function isSundayBR(dateObj) {
   return dateBRToUTCDate(dateObj).getUTCDay() === 0;
 }
+
 function isPastDateBR(dateObj) {
   const d = dateBRToUTCDate(dateObj);
   const now = new Date();
   const todayUTC = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
   return d < todayUTC;
 }
+
 function daysFromTodayBR(dateObj) {
   const d = dateBRToUTCDate(dateObj);
   const now = new Date();
@@ -570,9 +625,9 @@ function parseTime(text) {
 }
 
 function parseName(text) {
-  const m = text.match(/nome\s*[:\-]\s*([^\r\n]+)\s*$/i);
+  const m = text.match(/nome\s*[:\-]\s*([^\r ]+)\s*$/i);
   if (m) return m[1].trim();
-  const m2 = text.match(/no nome de\s+([^\r\n]+)\s*$/i);
+  const m2 = text.match(/no nome de\s+([^\r ]+)\s*$/i);
   if (m2) return m2[1].trim();
   return null;
 }
@@ -587,7 +642,6 @@ function parseNameSmart(text) {
 
   const idxDate = text.search(/\b([0-3]?\d)\/([01]?\d)(?:\/(\d{2}|\d{4}))?\b/);
   const idxTime = text.search(/\b([01]?\d|2[0-3])[:h]([0-5]\d)\b/);
-
   let cut = -1;
   if (idxDate >= 0 && idxTime >= 0) cut = Math.min(idxDate, idxTime);
   else cut = Math.max(idxDate, idxTime);
@@ -623,25 +677,38 @@ function looksLikeStandaloneName(text) {
   return true;
 }
 
-function parseAdultsChildren(text) {
+/**
+ * NOVO: extrai e SOMA total de pessoas.
+ * - entende adulto(s), criança(s), adolescente(s), bebê(s)
+ * - se não vier por categoria, cai no fallback "X pessoas"
+ */
+function parsePeopleTotal(text) {
   const t = normalizeText(text);
-  const m = t.match(/\b(\d+)\s*adult[oa]s?\b.*?\b(\d+)\s*crianc[ao]s?\b/);
-  if (m) return { adultos: Number(m[1]), criancas: Number(m[2]) };
 
-  const mA = t.match(/\b(\d+)\s*adult[oa]s?\b/);
-  if (mA) return { adultos: Number(mA[1]), criancas: 0 };
+  const buckets = [
+    { re: /\b(\d+)\s*(adulto|adulta|adultos|adultas)\b/g },
+    { re: /\b(\d+)\s*(crianca|criancas|criança|crianças)\b/g },
+    { re: /\b(\d+)\s*(adolescente|adolescentes)\b/g },
+    { re: /\b(\d+)\s*(bebe|bebes|bebê|bebês)\b/g },
+  ];
 
-  const mC = t.match(/\b(\d+)\s*crianc[ao]s?\b/);
-  if (mC) return { adultos: 0, criancas: Number(mC[1]) };
+  let sum = 0;
+  let matchedAny = false;
 
-  return null;
-}
+  for (const b of buckets) {
+    for (const m of t.matchAll(b.re)) {
+      matchedAny = true;
+      sum += Number(m[1]);
+    }
+  }
 
-function parsePeopleTotalFallback(text) {
-  const t = normalizeText(text);
+  if (matchedAny) return sum;
+
+  // fallback: "X pessoas/lugares"
   const m2 = t.match(/\b(\d+)\s*(pessoas|pessoa|lugares|lugar)\b/);
   if (m2) return Number(m2[1]);
 
+  // fallback: último número (evitando confundir com hora)
   const nums = [...t.matchAll(/\b(\d{1,2})\b/g)].map((x) => Number(x[1]));
   if (nums.length) {
     const time = parseTime(text);
@@ -652,6 +719,7 @@ function parsePeopleTotalFallback(text) {
     }
     return nums[nums.length - 1];
   }
+
   return null;
 }
 
@@ -663,31 +731,8 @@ function isTimeAllowed(hhmm) {
   return timeToMinutes(hhmm) <= timeToMinutes(RESERVA_HORA_MAX);
 }
 
-function peopleTotalFromConvData(data) {
-  if (data?.adultos != null && data?.criancas != null) return Number(data.adultos) + Number(data.criancas);
-  if (data?.pessoasTotal != null) return Number(data.pessoasTotal);
-  return null;
-}
-function peopleLabelFromConvData(data) {
-  if (data?.adultos != null && data?.criancas != null) {
-    const c = Number(data.criancas);
-    return `${data.adultos} adultos e ${data.criancas} criança${c === 1 ? "" : "s"}`;
-  }
-  if (data?.pessoasTotal != null) {
-    const n = Number(data.pessoasTotal);
-    return `${data.pessoasTotal} pessoa${n === 1 ? "" : "s"}`;
-  }
-  return "";
-}
-function peopleShortLabelFromConvData(data) {
-  if (data?.adultos != null && data?.criancas != null) return `${data.adultos}ad+${data.criancas}c`;
-  if (data?.pessoasTotal != null) return String(data.pessoasTotal);
-  return "";
-}
-
 // HOJE (SP) para reserva parcial
 function getTodayBRDateObjInSaoPaulo() {
-  // en-CA -> YYYY-MM-DD
   const fmt = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/Sao_Paulo",
     year: "numeric",
@@ -714,7 +759,6 @@ async function trelloGet(url) {
   if (!r.ok) throw new Error(`Trello GET failed ${r.status}: ${t}`);
   return JSON.parse(t);
 }
-
 async function trelloPost(url, bodyObj) {
   const full = new URL(url);
   full.searchParams.set("key", TRELLO_KEY);
@@ -728,23 +772,31 @@ async function trelloPost(url, bodyObj) {
   if (!r.ok) throw new Error(`Trello POST failed ${r.status}: ${t}`);
   return JSON.parse(t);
 }
-
 async function trelloFindListByName(boardId, listName) {
-  const lists = await trelloGet(`https://api.trello.com/1/boards/${boardId}/lists?fields=name,closed&limit=1000`);
+  const lists = await trelloGet(
+    `https://api.trello.com/1/boards/${boardId}/lists?fields=name,closed&limit=1000`
+  );
   return (lists || []).find((l) => !l.closed && l.name === listName) || null;
 }
-
 async function trelloEnsureList(boardId, listName) {
   const found = await trelloFindListByName(boardId, listName);
   if (found) return found;
-  return await trelloPost(`https://api.trello.com/1/lists?idBoard=${boardId}&name=${encodeURIComponent(listName)}`, null);
+  return await trelloPost(
+    `https://api.trello.com/1/lists?idBoard=${boardId}&name=${encodeURIComponent(listName)}`,
+    null
+  );
 }
 
 function parsePeopleFromCardName(name) {
-  const m = (name || "").match(/-\s*(\d{1,2})\s*$/);
+  // novo formato esperado: "- 8p" ou "- 8"
+  const m = (name || "").match(/-\s*(\d{1,2})\s*p\b/i);
   if (m) return Number(m[1]);
-  const m2 = (name || "").match(/-\s*(\d{1,2})\s*ad\+\s*(\d{1,2})\s*c\s*$/i);
-  if (m2) return Number(m2[1]) + Number(m2[2]);
+  const m2 = (name || "").match(/-\s*(\d{1,2})\s*$/);
+  if (m2) return Number(m2[1]);
+
+  // legado: "- 2ad+1c"
+  const m3 = (name || "").match(/-\s*(\d{1,2})\s*ad\+\s*(\d{1,2})\s*c\s*$/i);
+  if (m3) return Number(m3[1]) + Number(m3[2]);
   return null;
 }
 
@@ -755,44 +807,53 @@ async function trelloCountList(listId) {
   return { total, twoP };
 }
 
-async function trelloCreateReservaCard({ listId, nome, hora, pessoasLabel, telefone }) {
+async function trelloCreateReservaCard({ listId, nome, hora, pessoasTotal, telefone }) {
+  const pessoasLabel = `${Number(pessoasTotal)}p`;
   const title = `${nome} - ${hora} - ${pessoasLabel}`;
   const desc = `Telefone/WhatsApp: ${telefone}`;
   return await trelloPost(`https://api.trello.com/1/cards?idList=${listId}`, { name: title, desc });
 }
 
-// ===== Reserva templates =====
-async function getNotionReservaTemplate(name, fallback) {
-  const t = await notionFindExactByName(NOTION_DB_RESERVAS, name);
+// ===== Templates (Notion) =====
+async function getTemplate(templateKey, fallback) {
+  // Novo: DB templates
+  if (NOTION_DB_TEMPLATES) {
+    const t = await notionFindExactTextByTitleFlexible(NOTION_DB_TEMPLATES, templateKey, {
+      textPropCandidates: ["Mensagem", "Texto", "Resposta"],
+    });
+    return t && t.trim() ? t.trim() : fallback;
+  }
+
+  // Legado: DB reservas como templates
+  const t = await notionFindExactTextByTitleFlexible(NOTION_DB_RESERVAS, templateKey, {
+    textPropCandidates: ["Texto"],
+  });
   return t && t.trim() ? t.trim() : fallback;
 }
 
-async function buildConfirmMessageFromNotionOrFallback({ nome, dataList, hora, peopleLabel }) {
-  const tpl =
-    (await notionFindExactByName(NOTION_DB_RESERVAS, "Mensagem para mandar para o cliente da confirmaçao da reserva")) ||
-    "";
+async function buildConfirmMessageFromNotionOrFallback({ nome, dataList, hora, pessoasTotal }) {
+  const tplKey = "RESERVA_CONFIRMADA";
+  const tpl = (await getTemplate(tplKey, "")) || "";
+
+  const peopleLabel = `${Number(pessoasTotal)} pessoa${Number(pessoasTotal) === 1 ? "" : "s"}`;
 
   if (tpl.trim()) {
-    const reservaBlock =
-      `RESERVA: ` +
-      `Nome: ${nome} ` +
-      `Data: ${dataList} ` +
-      `N° de pessoas: ${peopleLabel} ` +
-      `Horário: ${hora}`;
-
-    if (/RESERVA:/i.test(tpl)) return tpl.replace(/RESERVA:\s*[\s\S]*$/i, reservaBlock).trim();
-    return (tpl.trim() + " " + reservaBlock).trim();
+    return tpl
+      .replace(/\{\{\s*nome\s*\}\}/gi, nome)
+      .replace(/\{\{\s*data\s*\}\}/gi, dataList)
+      .replace(/\{\{\s*hora\s*\}\}/gi, hora)
+      .replace(/\{\{\s*pessoas\s*\}\}/gi, peopleLabel)
+      .trim();
   }
 
   return (
-    `Perfeito! 😊 ` +
-    `Reserva confirmada: ` +
-    `Nome: ${nome} ` +
-    `Data: ${dataList} ` +
-    `N° de pessoas: ${peopleLabel} ` +
-    `Horário: ${hora} ` +
-    `❗ 15 minutos de tolerância - Após este período, a mesa pode ser liberada para quem está na fila de espera. ` +
-    `Se precisar alterar ou cancelar, é só avisar! 🍣✨`
+    `Perfeito! 😊\n` +
+    `Reserva confirmada:\n` +
+    `Nome: ${nome}\n` +
+    `Data: ${dataList}\n` +
+    `Horário: ${hora}\n` +
+    `Pessoas: ${peopleLabel}\n` +
+    `❗ 15 minutos de tolerância - após esse período, a mesa pode ser liberada.`
   );
 }
 
@@ -865,7 +926,7 @@ async function handleWebhook(bodyJson) {
     return;
   }
 
-  // throttle (depois do handoff delicado)
+  // throttle
   if (shouldThrottle(existing)) return;
 
   await ensureKnowledgeFresh();
@@ -875,7 +936,7 @@ async function handleWebhook(bodyJson) {
     if (FECHADO_DOMINGO !== "0" && isSundaySaoPaulo()) {
       await evolutionSendText({
         remoteJid,
-        text: "Hoje (domingo) a gente não abre 🙂\nFuncionamos de segunda a sábado, 18:30 às 23h. 🍣✨",
+        text: "Hoje (domingo) a gente não abre 🙂 Funcionamos de segunda a sábado, 18:30 às 23h. 🍣✨",
       });
       markBotReplied(state, remoteJid);
       return;
@@ -883,7 +944,7 @@ async function handleWebhook(bodyJson) {
 
     await evolutionSendText({
       remoteJid,
-      text: "Hoje a gente abre a partir das 18:30 e vai até 23h 🍣✨\nQuer que eu te ajude com uma reserva?",
+      text: "Hoje a gente abre a partir das 18:30 e vai até 23h 🍣✨ Quer que eu te ajude com uma reserva?",
     });
     markBotReplied(state, remoteJid);
     return;
@@ -893,10 +954,20 @@ async function handleWebhook(bodyJson) {
 
   // Greeting (SÓ se NÃO estiver em reserva)
   if (!inReservaFlow && looksLikeGreeting(incomingText)) {
-    const welcome =
-      (await notionFindExactByName(NOTION_DB_RESTAURANTE, NOTION_WELCOME_NAME)) ||
-      "Oieeee❤️ Aqui é a Liz! Assistente do Tsunagari. Conte comigo!";
-    await evolutionSendText({ remoteJid, text: welcome });
+    let welcome = null;
+    if (NOTION_DB_TEMPLATES) {
+      welcome = await getTemplate("BOAS_VINDAS", "");
+    }
+    if (!welcome) {
+      welcome = await notionFindExactTextByTitleFlexible(NOTION_DB_RESTAURANTE, NOTION_WELCOME_NAME, {
+        textPropCandidates: ["Texto"],
+      });
+    }
+
+    await evolutionSendText({
+      remoteJid,
+      text: welcome || "Oieeee❤️ Aqui é a Liz! Assistente do Tsunagari. Conte comigo!",
+    });
     markBotReplied(state, remoteJid);
     return;
   }
@@ -905,7 +976,7 @@ async function handleWebhook(bodyJson) {
   if (asksNonJapaneseFood(incomingText)) {
     await evolutionSendText({
       remoteJid,
-      text: "A gente é um restaurante japonês 🍣✨ Então não trabalhamos com pizza/hambúrguer. Quer que eu te mande nosso cardápio ou te explico as opções do rodízio?",
+      text: "A gente é um restaurante japonês 🍣✨ Então não trabalhamos com pizza/hambúrguer. Quer que eu te mande nosso cardápio ou te explico as opções?",
     });
     markBotReplied(state, remoteJid);
     return;
@@ -914,7 +985,7 @@ async function handleWebhook(bodyJson) {
   // Order intent => notify admin (só fora de reserva)
   if (!inReservaFlow && looksLikeOrderIntent(incomingText)) {
     const from = remoteJid.split("@")[0];
-    await notifyAdmin(`⚠️ POSSÍVEL PEDIDO (precisa de atendimento humano)\nCliente: ${from}\nMensagem: ${incomingText}`);
+    await notifyAdmin(`⚠️ POSSÍVEL PEDIDO (precisa de atendimento humano) Cliente: ${from} Mensagem: ${incomingText}`);
     await evolutionSendText({
       remoteJid,
       text: "Entendi! 😊 Só um instante que vou chamar alguém da equipe pra te ajudar por aqui. 🍣",
@@ -957,8 +1028,7 @@ async function handleWebhook(bodyJson) {
     const nomeSmart = parseNameSmart(incomingText);
     const dataList = parseDateToListName(incomingText);
     const hora = parseTime(incomingText);
-    const ac = parseAdultsChildren(incomingText);
-    const totalFallback = parsePeopleTotalFallback(incomingText);
+    const pessoasTotal = parsePeopleTotal(incomingText);
 
     if (nomeSmart) conv.data.nome = nomeSmart;
     if (dataList) conv.data.dataList = dataList;
@@ -976,13 +1046,7 @@ async function handleWebhook(bodyJson) {
       conv.data.nome = incomingText.trim();
     }
 
-    if (ac) {
-      conv.data.adultos = ac.adultos;
-      conv.data.criancas = ac.criancas;
-      conv.data.pessoasTotal = undefined;
-    } else if (totalFallback != null && conv.data.adultos == null && conv.data.criancas == null) {
-      conv.data.pessoasTotal = totalFallback;
-    }
+    if (pessoasTotal != null) conv.data.pessoasTotal = pessoasTotal;
 
     setConv(state, remoteJid, conv);
 
@@ -997,7 +1061,6 @@ async function handleWebhook(bodyJson) {
         markBotReplied(state, remoteJid);
         return;
       }
-
       if (isPastDateBR(conv.data.dateObj)) {
         await evolutionSendText({
           remoteJid,
@@ -1006,7 +1069,6 @@ async function handleWebhook(bodyJson) {
         markBotReplied(state, remoteJid);
         return;
       }
-
       const maxDays = Math.max(7, Number(MAX_ADVANCE_DAYS || 120));
       const delta = daysFromTodayBR(conv.data.dateObj);
       if (delta > maxDays) {
@@ -1024,15 +1086,14 @@ async function handleWebhook(bodyJson) {
     if (!conv.data.nome) missing.push("Nome");
     if (!conv.data.dataList) missing.push("Data (DD/MM ou DD/MM/AAAA)");
     if (!conv.data.hora) missing.push("Horário (ex.: 19:30)");
-    const totalNow = peopleTotalFromConvData(conv.data);
-    if (totalNow == null) missing.push("N° de pessoas (ex.: 3 adultos e 1 criança)");
+    if (conv.data.pessoasTotal == null) missing.push("N° de pessoas (ex.: 4 adultos, 2 adolescentes e 2 crianças)");
 
     if (missing.length) {
       if (shouldSuppressMissingRepeat(conv, missing)) return;
 
-      const pedir = await getNotionReservaTemplate(
-        "dados para a reserva",
-        "Para agendar sua reserva precisamos destes dados:\nNome:\nData:\nN° de pessoas: X adultos e X crianças\nHorário:\nAssim que mandar agendamos sua reserva!"
+      const pedir = await getTemplate(
+        "RESERVA_PEDIR_DADOS",
+        "Para fazer sua reserva, me manda por favor:\n- Nome completo\n- Data (DD/MM)\n- Horário\n- N° de pessoas"
       );
 
       if (inReservaFlow) {
@@ -1051,9 +1112,9 @@ async function handleWebhook(bodyJson) {
 
     // hour limit
     if (!isTimeAllowed(conv.data.hora)) {
-      const msg = await getNotionReservaTemplate(
-        "LIMITE HORARIO de reserva",
-        `Posso colocar ${RESERVA_HORA_MAX}? É o limite de horário para reserva. Tem 15min de tolerância. 😊`
+      const msg = await getTemplate(
+        "RESERVA_SUGERIR_HORARIO_LIMITE",
+        `Posso colocar ${RESERVA_HORA_MAX}? É o limite de horário para reserva. 😊`
       );
       conv.awaitingHoraMaxConfirm = true;
       setConv(state, remoteJid, conv);
@@ -1065,13 +1126,12 @@ async function handleWebhook(bodyJson) {
     // Trello capacity
     const list = await trelloEnsureList(TRELLO_BOARD_ID, conv.data.dataList);
     const counts = await trelloCountList(list.id);
-
     const maxTotal = Number(RESERVA_MAX_TOTAL_DIA);
     const max2p = Number(RESERVA_MAX_2P_DIA);
 
     if (counts.total >= maxTotal) {
-      const msg = await getNotionReservaTemplate(
-        "limite de reserva(checar trello)",
+      const msg = await getTemplate(
+        "RESERVA_SEM_VAGAS",
         "❗ Já atingimos o limite de reservas para esse dia. Você pode vir sem reserva, por ordem de chegada. 😊"
       );
       await evolutionSendText({ remoteJid, text: msg });
@@ -1080,11 +1140,7 @@ async function handleWebhook(bodyJson) {
       return;
     }
 
-    const totalForLimits = peopleTotalFromConvData(conv.data);
-    const isTwoPeople =
-      totalForLimits === 2 &&
-      (conv.data.adultos == null || (Number(conv.data.adultos) === 2 && Number(conv.data.criancas) === 0));
-
+    const isTwoPeople = Number(conv.data.pessoasTotal) === 2;
     if (isTwoPeople && counts.twoP >= max2p) {
       await evolutionSendText({
         remoteJid,
@@ -1097,22 +1153,20 @@ async function handleWebhook(bodyJson) {
 
     // Create card
     const telefone = remoteJid.split("@")[0];
-    const pessoasCard = peopleShortLabelFromConvData(conv.data) || String(totalForLimits);
     await trelloCreateReservaCard({
       listId: list.id,
       nome: conv.data.nome,
       hora: conv.data.hora,
-      pessoasLabel: pessoasCard,
+      pessoasTotal: conv.data.pessoasTotal,
       telefone,
     });
 
     // Confirm
-    const peopleLabel = peopleLabelFromConvData(conv.data) || `${totalForLimits} pessoas`;
     const confirmMsg = await buildConfirmMessageFromNotionOrFallback({
       nome: conv.data.nome,
       dataList: conv.data.dataList,
       hora: conv.data.hora,
-      peopleLabel,
+      pessoasTotal: conv.data.pessoasTotal,
     });
 
     await evolutionSendText({ remoteJid, text: confirmMsg });
@@ -1137,7 +1191,6 @@ const server = http.createServer((req, res) => {
 
   let buf = [];
   req.on("data", (c) => buf.push(c));
-
   req.on("end", async () => {
     // ACK rápido pro webhook
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
@@ -1155,12 +1208,11 @@ const server = http.createServer((req, res) => {
     } catch (e) {
       const msg = e?.message || String(e);
       console.error(`[${nowIso()}] handler_error`, msg);
-
       try {
         const remoteJid = bodyJson?.data?.key?.remoteJid || "";
         const incomingText = extractIncomingText(bodyJson);
         await notifyAdmin(
-          `🚨 ERRO no bot\njid: ${remoteJid.split("@")[0] || "(?)"}\nmsg: ${incomingText || "(sem texto)"}\nerr: ${msg.slice(0, 800)}`
+          `🚨 ERRO no bot jid: ${remoteJid.split("@")[0] || "(?)"} msg: ${incomingText || "(sem texto)"} err: ${msg.slice(0, 800)}`
         );
       } catch {}
     }
@@ -1174,7 +1226,6 @@ const server = http.createServer((req, res) => {
   } catch (e) {
     console.error(`[${nowIso()}] initial_load_failed`, e?.message || e);
   }
-
   const PORT = Number(process.env.PORT || 3000);
   server.listen(PORT, () => console.log(`[${nowIso()}] Tsunagari bot on :${PORT}`));
 })();
