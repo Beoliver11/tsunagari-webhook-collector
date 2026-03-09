@@ -1,25 +1,15 @@
 /**
  * Tsunagari WhatsApp Bot (Evolution + Notion + Trello + OpenAI) — “produção”
  *
- * Inclui:
- * - Handoff automático: fromMe=true pausa a conversa por HANDOFF_MINUTES
- * - Handoff inteligente: assunto delicado/fora do escopo OU insistência em horário impossível -> chama atendente + pausa
- * - Dedupe: ignora messageId repetido (se vier no payload)
- * - Throttle: cooldown por conversa
- * - Reserva: pede só os dados faltantes; domingo fechado; data passada; data muito distante; hora limite com sugestão (19:45)
- * - Reserva parcial: se cliente pedir reserva e informar horário (e não informar data) => assume data=HOJE (America/Sao_Paulo)
- * - Pessoas: mantém adultos/crianças (não soma e perde)
- * - Nome: pega nome completo (Nome: ...) + pega nome “solto” quando a conversa está em modo reserva
- * - Anti-spam: não repete a mesma lista de “faltando” a cada mensagem
- * - Pedidos: detecta pedido e avisa ADMIN_WHATSAPP
- * - Alertas de erro: manda erro pro admin
- * - Links: sem markdown; só manda link se cliente pedir
- * - PORT via process.env.PORT (EasyPanel)
- * - FIX domingo “abre hoje?”: regra determinística (não depende do OpenAI)
- * - FIX FAQ: NÃO carrega NOTION_DB_RESERVAS no KNOWLEDGE (evita “limite de reservas” em pergunta geral)
- *
- * OBS:
- * - Mantém o HANDOFF_MINUTES exatamente como está na configuração (não mexe).
+ * Atualizações incluídas:
+ * - FIX domingo / “abre hoje?” por regra (America/Sao_Paulo), sem OpenAI
+ * - FAQ sem poluição de reservas: NÃO carrega NOTION_DB_RESERVAS no KNOWLEDGE
+ * - Reserva parcial: se cliente pedir reserva e informar horário (mas não data) => assume data=HOJE (SP)
+ * - Greeting não dispara dentro do fluxo de reserva
+ * - Handoff inteligente (assunto delicado / insistência em horário impossível):
+ *    - manda msg pro cliente + alerta para HUMAN_NUMBERS (+ ADMIN_WHATSAPP)
+ *    - NÃO pausa o chat (pause continua sendo só via fromMe=true)
+ * - Assunto delicado fura throttle (sempre chama humano)
  */
 
 const http = require("http");
@@ -38,16 +28,15 @@ const {
   EVOLUTION_INSTANCE = "n8n Tsunagari",
   EVOLUTION_SEND_PATH = "/message/sendText",
 
-  // Admin alerts
+  // Alerts / humans
   ADMIN_WHATSAPP = "",
+  HUMAN_NUMBERS = "",
 
   // Production knobs
   HANDOFF_MINUTES = "180",
   COOLDOWN_MS = "1500",
   DEDUPE_TTL_MS = "600000",
-
-  // anti-spam do “faltando”
-  MISSING_REPEAT_SUPPRESS_MS = "60000", // 60s
+  MISSING_REPEAT_SUPPRESS_MS = "60000",
 
   // Notion
   NOTION_TOKEN,
@@ -93,22 +82,7 @@ function normalizeText(s) {
     .trim();
 }
 
-// ===== Greeting / intents =====
-function looksLikeGreeting(text) {
-  // saudação "pura": evita atrapalhar o fluxo de reserva/FAQ
-  const t = normalizeText(text);
-  if (t.includes("?")) return false;
-  if (looksLikeReservaIntent(t)) return false;
-  if (looksLikeOrderIntent(t)) return false;
-  if (t.length > 25) return false;
-  return /^(oi|ola|oie+|bom dia|boa tarde|boa noite)\b/.test(t);
-}
-
-/**
- * Intent de reserva MAIS RÍGIDO
- * - NÃO usa “pra amanhã/pra hoje” como gatilho sozinho
- * - só entra em reserva se tiver termos claros (reserva/mesa/agendar/marcar)
- */
+// ===== intents / parsing =====
 function looksLikeReservaIntent(text) {
   const t = normalizeText(text);
   return (
@@ -128,6 +102,16 @@ function looksLikeOrderIntent(text) {
       t
     ) || /\b(ifood|i-food|ubereats|uber eats|rappi)\b/.test(t)
   );
+}
+
+function looksLikeGreeting(text) {
+  // Saudação “pura”, curta, e sem intenção junto
+  const t = normalizeText(text);
+  if (t.includes("?")) return false;
+  if (looksLikeReservaIntent(t)) return false;
+  if (looksLikeOrderIntent(t)) return false;
+  if (t.length > 25) return false;
+  return /^(oi|ola|oie+|bom dia|boa tarde|boa noite)\b/.test(t);
 }
 
 function isAffirmative(text) {
@@ -165,19 +149,16 @@ function getIncomingMessageId(bodyJson) {
 
 // ===== FIX domingo: “abre hoje?” determinístico (timezone SP) =====
 function weekdaySaoPauloShort() {
-  // returns sun|mon|tue|wed|thu|fri|sat
   const fmt = new Intl.DateTimeFormat("en-US", { timeZone: "America/Sao_Paulo", weekday: "short" });
-  return fmt.format(new Date()).toLowerCase();
+  return fmt.format(new Date()).toLowerCase(); // sun|mon|...
 }
 function isSundaySaoPaulo() {
   return weekdaySaoPauloShort() === "sun";
 }
 function looksLikeOpenTodayQuestion(text) {
   const t = normalizeText(text);
-
   if (t.includes("abre hoje") || t.includes("abrem hoje") || t.includes("funciona hoje")) return true;
   if (t.includes("estao abertos hoje") || t.includes("estão abertos hoje")) return true;
-
   const hasHoje = /\bhoje\b/.test(t);
   const hasOpenVerb = /\b(abre|abrem|aberto|abertos|funciona|funcionam)\b/.test(t);
   return hasHoje && hasOpenVerb;
@@ -313,12 +294,12 @@ async function notionFindExactByName(dbId, name) {
   return text.trim() || null;
 }
 
-// ===== Knowledge cache =====
+// ===== Knowledge cache (FAQ) =====
 let KNOWLEDGE = [];
 let lastLoadAt = 0;
 
 async function loadKnowledge() {
-  // FIX: NÃO incluir NOTION_DB_RESERVAS aqui (evita “limite de reservas” no FAQ)
+  // NÃO incluir NOTION_DB_RESERVAS aqui
   const dbs = [
     { name: "restaurante", id: NOTION_DB_RESTAURANTE },
     { name: "politica", id: NOTION_DB_POLITICA },
@@ -371,21 +352,44 @@ async function notifyAdmin(text) {
   }
 }
 
-async function handoffToHuman({ state, remoteJid, reason, incomingText }) {
-  // avisa admin
-  await notifyAdmin(
-    `🙋 HANDOFF (atendimento humano)\nMotivo: ${reason}\nCliente: ${remoteJid.split("@")[0]}\nMensagem: ${incomingText}`
-  );
+function parseHumanNumbers() {
+  return String(HUMAN_NUMBERS || "")
+    .split(/[,;\s]+/g)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
 
-  // avisa cliente
+async function notifyHumans(text) {
+  const nums = parseHumanNumbers();
+  if (!nums.length) return;
+  for (const num of nums) {
+    await evolutionSendText({ remoteJid: `${num}@s.whatsapp.net`, text });
+  }
+}
+
+/**
+ * Handoff inteligente:
+ * - chama humanos (HUMAN_NUMBERS + ADMIN_WHATSAPP)
+ * - manda msg pro cliente
+ * - NÃO pausa o chat (pause continua sendo só via fromMe=true)
+ */
+async function handoffToHuman({ state, remoteJid, reason, incomingText }) {
+  const from = remoteJid.split("@")[0];
+
   await evolutionSendText({
     remoteJid,
     text: "Entendi. Só um instante que vou chamar alguém da equipe pra te ajudar direitinho por aqui. 🙏",
   });
 
-  // pausa (não mexer; usar HANDOFF_MINUTES como está)
-  const mins = Math.max(5, Number(HANDOFF_MINUTES || 180));
-  setHandoffPause(state, remoteJid, mins);
+  const alert =
+    `🙋 ATENDIMENTO HUMANO\n` +
+    `Motivo: ${reason}\n` +
+    `Cliente: ${from}\n` +
+    `Mensagem: ${incomingText}`;
+
+  await notifyHumans(alert);
+  await notifyAdmin(alert);
+
   markBotReplied(state, remoteJid);
 }
 
@@ -526,12 +530,8 @@ function parseDateToListName(text) {
   let dd = m[1].padStart(2, "0");
   let mm = m[2].padStart(2, "0");
   let yy = m[3];
-  if (!yy) {
-    const now = new Date();
-    yy = String(now.getFullYear()).slice(-2);
-  } else if (yy.length === 4) {
-    yy = yy.slice(-2);
-  }
+  if (!yy) yy = String(new Date().getFullYear()).slice(-2);
+  else if (yy.length === 4) yy = yy.slice(-2);
   return `${dd}/${mm}/${yy}`;
 }
 
@@ -540,7 +540,7 @@ function parseDateBR(text) {
   if (!m) return null;
   const dd = Number(m[1]);
   const mm = Number(m[2]);
-  let yyyy = m[3] ? Number(m[3].length === 2 ? "20" + m[3] : m[3]) : new Date().getFullYear();
+  const yyyy = m[3] ? Number(m[3].length === 2 ? "20" + m[3] : m[3]) : new Date().getFullYear();
   return { dd, mm, yyyy };
 }
 
@@ -569,7 +569,6 @@ function parseTime(text) {
   return `${m[1].padStart(2, "0")}:${m[2]}`;
 }
 
-// FIX: aceita nome completo depois de "nome:"
 function parseName(text) {
   const m = text.match(/nome\s*[:\-]\s*([^\r\n]+)\s*$/i);
   if (m) return m[1].trim();
@@ -578,10 +577,10 @@ function parseName(text) {
   return null;
 }
 
-// infer name only when message contains date/time later
 function parseNameSmart(text) {
   const explicit = parseName(text);
   if (explicit) return explicit;
+
   const hasDate = /\b([0-3]?\d)\/([01]?\d)(?:\/(\d{2}|\d{4}))?\b/.test(text);
   const hasTime = /\b([01]?\d|2[0-3])[:h]([0-5]\d)\b/.test(text);
   if (!hasDate && !hasTime) return null;
@@ -731,19 +730,14 @@ async function trelloPost(url, bodyObj) {
 }
 
 async function trelloFindListByName(boardId, listName) {
-  const lists = await trelloGet(
-    `https://api.trello.com/1/boards/${boardId}/lists?fields=name,closed&limit=1000`
-  );
+  const lists = await trelloGet(`https://api.trello.com/1/boards/${boardId}/lists?fields=name,closed&limit=1000`);
   return (lists || []).find((l) => !l.closed && l.name === listName) || null;
 }
 
 async function trelloEnsureList(boardId, listName) {
   const found = await trelloFindListByName(boardId, listName);
   if (found) return found;
-  return await trelloPost(
-    `https://api.trello.com/1/lists?idBoard=${boardId}&name=${encodeURIComponent(listName)}`,
-    null
-  );
+  return await trelloPost(`https://api.trello.com/1/lists?idBoard=${boardId}&name=${encodeURIComponent(listName)}`, null);
 }
 
 function parsePeopleFromCardName(name) {
@@ -767,7 +761,7 @@ async function trelloCreateReservaCard({ listId, nome, hora, pessoasLabel, telef
   return await trelloPost(`https://api.trello.com/1/cards?idList=${listId}`, { name: title, desc });
 }
 
-// ===== Reserva messages =====
+// ===== Reserva templates =====
 async function getNotionReservaTemplate(name, fallback) {
   const t = await notionFindExactByName(NOTION_DB_RESERVAS, name);
   return t && t.trim() ? t.trim() : fallback;
@@ -775,10 +769,9 @@ async function getNotionReservaTemplate(name, fallback) {
 
 async function buildConfirmMessageFromNotionOrFallback({ nome, dataList, hora, peopleLabel }) {
   const tpl =
-    (await notionFindExactByName(
-      NOTION_DB_RESERVAS,
-      "Mensagem para mandar para o cliente da confirmaçao da reserva"
-    )) || "";
+    (await notionFindExactByName(NOTION_DB_RESERVAS, "Mensagem para mandar para o cliente da confirmaçao da reserva")) ||
+    "";
+
   if (tpl.trim()) {
     const reservaBlock =
       `RESERVA: ` +
@@ -787,9 +780,7 @@ async function buildConfirmMessageFromNotionOrFallback({ nome, dataList, hora, p
       `N° de pessoas: ${peopleLabel} ` +
       `Horário: ${hora}`;
 
-    if (/RESERVA:/i.test(tpl)) {
-      return tpl.replace(/RESERVA:\s*[\s\S]*$/i, reservaBlock).trim();
-    }
+    if (/RESERVA:/i.test(tpl)) return tpl.replace(/RESERVA:\s*[\s\S]*$/i, reservaBlock).trim();
     return (tpl.trim() + " " + reservaBlock).trim();
   }
 
@@ -838,7 +829,7 @@ async function handleWebhook(bodyJson) {
   const remoteJid = bodyJson?.data?.key?.remoteJid;
   if (!remoteJid) return;
 
-  // HANDOFF: humano falou
+  // Handoff automático: humano falou
   if (bodyJson?.data?.key?.fromMe) {
     const state = loadState();
     const mins = Math.max(5, Number(HANDOFF_MINUTES || 180));
@@ -863,12 +854,7 @@ async function handleWebhook(bodyJson) {
   const existing = getConv(state, remoteJid);
   if (existing?.handoffUntil && existing.handoffUntil > Date.now()) return;
 
-  // throttle
-  if (shouldThrottle(existing)) return;
-
-  await ensureKnowledgeFresh();
-
-  // assunto delicado => handoff inteligente
+  // Assunto delicado => handoff (FURA throttle)
   if (looksLikeSensitiveTopic(incomingText)) {
     await handoffToHuman({
       state,
@@ -878,6 +864,11 @@ async function handleWebhook(bodyJson) {
     });
     return;
   }
+
+  // throttle (depois do handoff delicado)
+  if (shouldThrottle(existing)) return;
+
+  await ensureKnowledgeFresh();
 
   // FIX domingo “abre hoje?”
   if (looksLikeOpenTodayQuestion(incomingText)) {
@@ -900,7 +891,7 @@ async function handleWebhook(bodyJson) {
 
   const inReservaFlow = existing?.mode === "reserva";
 
-  // Greeting (SÓ se NÃO estiver no fluxo de reserva)
+  // Greeting (SÓ se NÃO estiver em reserva)
   if (!inReservaFlow && looksLikeGreeting(incomingText)) {
     const welcome =
       (await notionFindExactByName(NOTION_DB_RESTAURANTE, NOTION_WELCOME_NAME)) ||
@@ -932,7 +923,7 @@ async function handleWebhook(bodyJson) {
     return;
   }
 
-  // Reserva flow
+  // ===== Reserva flow =====
   if (looksLikeReservaIntent(incomingText) || inReservaFlow) {
     const conv = existing && inReservaFlow ? existing : { mode: "reserva", data: {}, startedAt: Date.now() };
 
@@ -973,7 +964,7 @@ async function handleWebhook(bodyJson) {
     if (dataList) conv.data.dataList = dataList;
     if (hora) conv.data.hora = hora;
 
-    // NOVO: se tem hora e não tem data => assumir HOJE (SP)
+    // Reserva parcial: se tem hora e não tem data => assumir HOJE (SP)
     if (!conv.data.dataList && conv.data.hora) {
       const todayObj = getTodayBRDateObjInSaoPaulo();
       conv.data.dateObj = todayObj;
@@ -1006,15 +997,23 @@ async function handleWebhook(bodyJson) {
         markBotReplied(state, remoteJid);
         return;
       }
+
       if (isPastDateBR(conv.data.dateObj)) {
-        await evolutionSendText({ remoteJid, text: "Essa data já passou 🙂 Consegue me confirmar a data da reserva (DD/MM)?" });
+        await evolutionSendText({
+          remoteJid,
+          text: "Essa data já passou 🙂 Consegue me confirmar a data da reserva (DD/MM)?",
+        });
         markBotReplied(state, remoteJid);
         return;
       }
+
       const maxDays = Math.max(7, Number(MAX_ADVANCE_DAYS || 120));
       const delta = daysFromTodayBR(conv.data.dateObj);
       if (delta > maxDays) {
-        await evolutionSendText({ remoteJid, text: `Consigo te ajudar sim 😊 Só me confirma uma data mais próxima (até ${maxDays} dias).` });
+        await evolutionSendText({
+          remoteJid,
+          text: `Consigo te ajudar sim 😊 Só me confirma uma data mais próxima (até ${maxDays} dias).`,
+        });
         markBotReplied(state, remoteJid);
         return;
       }
@@ -1122,7 +1121,7 @@ async function handleWebhook(bodyJson) {
     return;
   }
 
-  // General doubts => Notion + OpenAI
+  // ===== FAQ (Notion + OpenAI) =====
   const retrieved = simpleRetrieve(incomingText, KNOWLEDGE, 12);
   const answer = await openaiAnswer({ question: incomingText, retrieved });
   await evolutionSendText({ remoteJid, text: answer });
