@@ -1,26 +1,25 @@
 /**
  * Tsunagari WhatsApp Bot (Evolution + Notion + Trello + OpenAI) — “produção”
  *
- * O que este arquivo resolve:
+ * Inclui:
  * - Handoff automático: fromMe=true pausa a conversa por HANDOFF_MINUTES
+ * - Handoff inteligente: assunto delicado/fora do escopo OU insistência em horário impossível -> chama atendente + pausa
  * - Dedupe: ignora messageId repetido (se vier no payload)
  * - Throttle: cooldown por conversa
- * - Reserva: pede dados, domingo fechado, data passada, data muito distante, hora limite com sugestão (19:45)
+ * - Reserva: pede só os dados faltantes; domingo fechado; data passada; data muito distante; hora limite com sugestão (19:45)
+ * - Reserva parcial: se cliente pedir reserva e informar horário (e não informar data) => assume data=HOJE (America/Sao_Paulo)
  * - Pessoas: mantém adultos/crianças (não soma e perde)
  * - Nome: pega nome completo (Nome: ...) + pega nome “solto” quando a conversa está em modo reserva
- * - Falso positivo de reserva: "amanhã/hoje" sozinho NÃO inicia reserva
  * - Anti-spam: não repete a mesma lista de “faltando” a cada mensagem
  * - Pedidos: detecta pedido e avisa ADMIN_WHATSAPP
  * - Alertas de erro: manda erro pro admin
  * - Links: sem markdown; só manda link se cliente pedir
  * - PORT via process.env.PORT (EasyPanel)
+ * - FIX domingo “abre hoje?”: regra determinística (não depende do OpenAI)
+ * - FIX FAQ: NÃO carrega NOTION_DB_RESERVAS no KNOWLEDGE (evita “limite de reservas” em pergunta geral)
  *
- * FIX (domingo / “abre hoje?”):
- * - Perguntas “abre hoje / funciona hoje / estão abertos hoje?” são tratadas por regra
- * - Usa timezone America/Sao_Paulo
- *
- * FIX (mistura de “limite de reservas” em FAQ):
- * - NÃO carrega NOTION_DB_RESERVAS no KNOWLEDGE do FAQ (fica só para templates do fluxo de reserva)
+ * OBS:
+ * - Mantém o HANDOFF_MINUTES exatamente como está na configuração (não mexe).
  */
 
 const http = require("http");
@@ -94,22 +93,19 @@ function normalizeText(s) {
     .trim();
 }
 
-// saudação robusta: "Olá," "Olá!" "Oi..."
+// ===== Greeting / intents =====
 function looksLikeGreeting(text) {
+  // saudação "pura": evita atrapalhar o fluxo de reserva/FAQ
   const t = normalizeText(text);
-
-  // se tem pergunta/intenção junto, não é saudação pura
   if (t.includes("?")) return false;
   if (looksLikeReservaIntent(t)) return false;
   if (looksLikeOrderIntent(t)) return false;
-
-  // saudação curta
   if (t.length > 25) return false;
-
   return /^(oi|ola|oie+|bom dia|boa tarde|boa noite)\b/.test(t);
 }
+
 /**
- * FIX IMPORTANTE: Intent de reserva MAIS RÍGIDO
+ * Intent de reserva MAIS RÍGIDO
  * - NÃO usa “pra amanhã/pra hoje” como gatilho sozinho
  * - só entra em reserva se tiver termos claros (reserva/mesa/agendar/marcar)
  */
@@ -122,6 +118,15 @@ function looksLikeReservaIntent(text) {
     t.includes("mesa") ||
     t.includes("agendar") ||
     t.includes("marcar")
+  );
+}
+
+function looksLikeOrderIntent(text) {
+  const t = normalizeText(text);
+  return (
+    /\b(pedido|pedir|quero pedir|vou querer|me ve|me vê|manda|entrega|delivery|retirar|take away|para viagem)\b/.test(
+      t
+    ) || /\b(ifood|i-food|ubereats|uber eats|rappi)\b/.test(t)
   );
 }
 
@@ -158,35 +163,12 @@ function getIncomingMessageId(bodyJson) {
   return bodyJson?.data?.key?.id || bodyJson?.data?.messageId || bodyJson?.data?.id || "";
 }
 
-// ===== FIX: “abre hoje?” (domingo) =====
+// ===== FIX domingo: “abre hoje?” determinístico (timezone SP) =====
 function weekdaySaoPauloShort() {
-  // returns: sun|mon|tue|wed|thu|fri|sat
+  // returns sun|mon|tue|wed|thu|fri|sat
   const fmt = new Intl.DateTimeFormat("en-US", { timeZone: "America/Sao_Paulo", weekday: "short" });
   return fmt.format(new Date()).toLowerCase();
 }
-
-function getTodayBRDateObjInSaoPaulo() {
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Sao_Paulo",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-  // en-CA dá YYYY-MM-DD
-  const parts = fmt.format(new Date()).split("-");
-  const yyyy = Number(parts[0]);
-  const mm = Number(parts[1]);
-  const dd = Number(parts[2]);
-  return { dd, mm, yyyy };
-}
-
-function dateObjToDataList(dateObj) {
-  const dd = String(dateObj.dd).padStart(2, "0");
-  const mm = String(dateObj.mm).padStart(2, "0");
-  const yy = String(dateObj.yyyy).slice(-2);
-  return `${dd}/${mm}/${yy}`;
-}
-
 function isSundaySaoPaulo() {
   return weekdaySaoPauloShort() === "sun";
 }
@@ -201,8 +183,22 @@ function looksLikeOpenTodayQuestion(text) {
   return hasHoje && hasOpenVerb;
 }
 
+// ===== Handoff inteligente =====
+function looksLikeSensitiveTopic(text) {
+  const t = normalizeText(text);
+  return /\b(hospital|uti|emergencia|emergência|acidente|sangue|ferido|morreu|morte|falecimento|luto|amea(c|ç)a|suicid|assalt|violenc|violência|policia|polícia)\b/.test(
+    t
+  );
+}
+
+function looksLikeInsistence(text) {
+  const t = normalizeText(text);
+  return /\b(insisto|tem como|não tem como|nao tem como|por favor|mas eu|mas preciso|eu preciso)\b/.test(t);
+}
+
 // ======== Persistent state (file) ========
 const STATE_PATH = path.join(process.cwd(), "state.json");
+
 function loadState() {
   try {
     return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
@@ -287,7 +283,7 @@ async function notionQueryAllRows(dbId, pageSize = 100) {
       const text = p.properties?.Texto?.rich_text?.map((t) => t.plain_text).join("") || "";
       const nm = name.trim();
       const tx = text.trim();
-      if (!nm && !tx) continue; // ignora vazio
+      if (!nm && !tx) continue;
       rows.push({ name: nm, text: tx });
     }
     if (!j.has_more) break;
@@ -322,7 +318,7 @@ let KNOWLEDGE = [];
 let lastLoadAt = 0;
 
 async function loadKnowledge() {
-  // FIX: NÃO incluir NOTION_DB_RESERVAS aqui (evita “limite de reservas” aparecendo em FAQ)
+  // FIX: NÃO incluir NOTION_DB_RESERVAS aqui (evita “limite de reservas” no FAQ)
   const dbs = [
     { name: "restaurante", id: NOTION_DB_RESTAURANTE },
     { name: "politica", id: NOTION_DB_POLITICA },
@@ -350,7 +346,12 @@ async function ensureKnowledgeFresh() {
 // ===== Evolution send =====
 async function evolutionSendText({ remoteJid, text }) {
   const number = (remoteJid || "").split("@")[0];
-  const url = EVOLUTION_SERVER_URL.replace(/\/$/, "") + EVOLUTION_SEND_PATH + "/" + encodeURIComponent(EVOLUTION_INSTANCE);
+  const url =
+    EVOLUTION_SERVER_URL.replace(/\/$/, "") +
+    EVOLUTION_SEND_PATH +
+    "/" +
+    encodeURIComponent(EVOLUTION_INSTANCE);
+
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", apikey: EVOLUTION_APIKEY },
@@ -368,6 +369,24 @@ async function notifyAdmin(text) {
   } catch (e) {
     console.error(`[${nowIso()}] admin_notify_failed`, e?.message || e);
   }
+}
+
+async function handoffToHuman({ state, remoteJid, reason, incomingText }) {
+  // avisa admin
+  await notifyAdmin(
+    `🙋 HANDOFF (atendimento humano)\nMotivo: ${reason}\nCliente: ${remoteJid.split("@")[0]}\nMensagem: ${incomingText}`
+  );
+
+  // avisa cliente
+  await evolutionSendText({
+    remoteJid,
+    text: "Entendi. Só um instante que vou chamar alguém da equipe pra te ajudar direitinho por aqui. 🙏",
+  });
+
+  // pausa (não mexer; usar HANDOFF_MINUTES como está)
+  const mins = Math.max(5, Number(HANDOFF_MINUTES || 180));
+  setHandoffPause(state, remoteJid, mins);
+  markBotReplied(state, remoteJid);
 }
 
 // ===== Retrieve =====
@@ -406,18 +425,17 @@ function unmarkdownLinks(t) {
 }
 function stripLinks(text) {
   let t = text || "";
-  t = t.replace(/\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/gi, ""); // remove markdown link whole
-  t = t.replace(/https?:\/\/\S+/gi, ""); // remove raw urls
+  t = t.replace(/\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/gi, "");
+  t = t.replace(/https?:\/\/\S+/gi, "");
   return t;
 }
 function sanitizeAnswer(text, question) {
   let t = (text || "").trim();
-  // remove leading greeting
   t = t.replace(
     /^(oi|ol[aá]|oie+)\s*[!,.:;\-–—]*\s*(?:[A-Za-zÀ-ÿ0-9_.-]{2,30})?\s*[!,.:;\-–—]*\s*/i,
     ""
   );
-  // remove closings
+
   const closings = [
     /\babracos\b\.?\s*$/i,
     /\babraços\b\.?\s*$/i,
@@ -434,8 +452,10 @@ function sanitizeAnswer(text, question) {
     t = t.trim();
     if (t !== before) changed = true;
   }
+
   if (shouldAllowLinks(question)) t = unmarkdownLinks(t);
   else t = stripLinks(t);
+
   t = t.replace(/[ \t]+ /g, " ").replace(/ {3,}/g, " ").trim();
   return t.trim();
 }
@@ -480,26 +500,22 @@ Trechos do Notion: ${context || "(nenhuma informação relevante encontrada)"}
 
   const j = await r.json();
   if (!r.ok) throw new Error(`OpenAI failed ${r.status}: ${JSON.stringify(j)}`);
+
   const out = (j.output || []).flatMap((o) => o.content || []);
   const raw = out
     .filter((c) => c.type === "output_text")
     .map((c) => c.text)
     .join("")
     .trim();
+
   return sanitizeAnswer(raw, question);
 }
 
-// ===== Hard rules =====
+// ===== Other rules =====
 function asksNonJapaneseFood(text) {
   const t = normalizeText(text);
-  return /\b(pizza|hamburguer|hamburger|hambúrguer|burger|x[-\s]?burger|lanche|esfiha|pastel|churrasco|lasanha|macarrao|macarrão)\b/.test(t);
-}
-
-function looksLikeOrderIntent(text) {
-  const t = normalizeText(text);
-  return (
-    /\b(pedido|pedir|quero pedir|vou querer|me ve|me vê|manda|entrega|delivery|retirar|take away|para viagem)\b/.test(t) ||
-    /\b(ifood|i-food|ubereats|uber eats|rappi)\b/.test(t)
+  return /\b(pizza|hamburguer|hamburger|hambúrguer|burger|x[-\s]?burger|lanche|esfiha|pastel|churrasco|lasanha|macarrao|macarrão)\b/.test(
+    t
   );
 }
 
@@ -532,8 +548,7 @@ function dateBRToUTCDate({ dd, mm, yyyy }) {
   return new Date(Date.UTC(yyyy, mm - 1, dd, 0, 0, 0));
 }
 function isSundayBR(dateObj) {
-  const d = dateBRToUTCDate(dateObj);
-  return d.getUTCDay() === 0;
+  return dateBRToUTCDate(dateObj).getUTCDay() === 0;
 }
 function isPastDateBR(dateObj) {
   const d = dateBRToUTCDate(dateObj);
@@ -545,8 +560,7 @@ function daysFromTodayBR(dateObj) {
   const d = dateBRToUTCDate(dateObj);
   const now = new Date();
   const todayUTC = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
-  const diffMs = d - todayUTC;
-  return Math.floor(diffMs / (24 * 60 * 60 * 1000));
+  return Math.floor((d - todayUTC) / (24 * 60 * 60 * 1000));
 }
 
 function parseTime(text) {
@@ -555,10 +569,11 @@ function parseTime(text) {
   return `${m[1].padStart(2, "0")}:${m[2]}`;
 }
 
+// FIX: aceita nome completo depois de "nome:"
 function parseName(text) {
-  const m = text.match(/nome\s*[:\-]\s*([^ \r]+)/i);
+  const m = text.match(/nome\s*[:\-]\s*([^\r\n]+)\s*$/i);
   if (m) return m[1].trim();
-  const m2 = text.match(/no nome de\s+([^ \r]+)/i);
+  const m2 = text.match(/no nome de\s+([^\r\n]+)\s*$/i);
   if (m2) return m2[1].trim();
   return null;
 }
@@ -570,38 +585,41 @@ function parseNameSmart(text) {
   const hasDate = /\b([0-3]?\d)\/([01]?\d)(?:\/(\d{2}|\d{4}))?\b/.test(text);
   const hasTime = /\b([01]?\d|2[0-3])[:h]([0-5]\d)\b/.test(text);
   if (!hasDate && !hasTime) return null;
+
   const idxDate = text.search(/\b([0-3]?\d)\/([01]?\d)(?:\/(\d{2}|\d{4}))?\b/);
   const idxTime = text.search(/\b([01]?\d|2[0-3])[:h]([0-5]\d)\b/);
+
   let cut = -1;
   if (idxDate >= 0 && idxTime >= 0) cut = Math.min(idxDate, idxTime);
   else cut = Math.max(idxDate, idxTime);
   if (cut <= 0) return null;
+
   let candidate = text.slice(0, cut).trim();
   candidate = candidate.replace(/^[\-\s:–—]+/, "").replace(/[\-\s:–—]+$/, "").trim();
   candidate = candidate.replace(/^\d+\s+/, "").trim();
+
   const words = candidate.split(/\s+/).filter(Boolean);
   if (!words.length) return null;
+
   const bad = new Set(["reserva", "reservar", "quero", "mesa", "agendar", "marcar"]);
   if (words.length === 1 && bad.has(normalizeText(words[0]))) return null;
-  return words.slice(0, 4).join(" ").trim() || null;
+
+  return words.slice(0, 6).join(" ").trim() || null;
 }
 
-/**
- * FIX: no fluxo de reserva, se ainda falta nome e a pessoa mandar só "Nome Sobrenome",
- * a gente aceita como nome (mesmo sem data/hora na mesma msg).
- */
 function looksLikeStandaloneName(text) {
   const raw = (text || "").trim();
   if (!raw) return false;
-  if (/\d/.test(raw)) return false; // não pode ter número
+  if (/\d/.test(raw)) return false;
   if (raw.length < 4 || raw.length > 60) return false;
+
   const t = normalizeText(raw);
-  // não aceitar frases comuns
   if (/\b(reserva|reservar|mesa|amanha|hoje|horario|horário|pessoas|adultos|criancas|crianças)\b/.test(t))
     return false;
+
   const words = raw.split(/\s+/).filter(Boolean);
-  if (words.length < 2 || words.length > 4) return false;
-  // precisa ser basicamente letras/pontos/hífen
+  if (words.length < 2 || words.length > 5) return false;
+
   if (!/^[A-Za-zÀ-ÿ'.-]+(\s+[A-Za-zÀ-ÿ'.-]+)+$/.test(raw)) return false;
   return true;
 }
@@ -610,10 +628,13 @@ function parseAdultsChildren(text) {
   const t = normalizeText(text);
   const m = t.match(/\b(\d+)\s*adult[oa]s?\b.*?\b(\d+)\s*crianc[ao]s?\b/);
   if (m) return { adultos: Number(m[1]), criancas: Number(m[2]) };
+
   const mA = t.match(/\b(\d+)\s*adult[oa]s?\b/);
   if (mA) return { adultos: Number(mA[1]), criancas: 0 };
+
   const mC = t.match(/\b(\d+)\s*crianc[ao]s?\b/);
   if (mC) return { adultos: 0, criancas: Number(mC[1]) };
+
   return null;
 }
 
@@ -621,6 +642,7 @@ function parsePeopleTotalFallback(text) {
   const t = normalizeText(text);
   const m2 = t.match(/\b(\d+)\s*(pessoas|pessoa|lugares|lugar)\b/);
   if (m2) return Number(m2[1]);
+
   const nums = [...t.matchAll(/\b(\d{1,2})\b/g)].map((x) => Number(x[1]));
   if (nums.length) {
     const time = parseTime(text);
@@ -643,13 +665,10 @@ function isTimeAllowed(hhmm) {
 }
 
 function peopleTotalFromConvData(data) {
-  if (data?.adultos != null && data?.criancas != null) {
-    return Number(data.adultos) + Number(data.criancas);
-  }
+  if (data?.adultos != null && data?.criancas != null) return Number(data.adultos) + Number(data.criancas);
   if (data?.pessoasTotal != null) return Number(data.pessoasTotal);
   return null;
 }
-
 function peopleLabelFromConvData(data) {
   if (data?.adultos != null && data?.criancas != null) {
     const c = Number(data.criancas);
@@ -661,13 +680,29 @@ function peopleLabelFromConvData(data) {
   }
   return "";
 }
-
 function peopleShortLabelFromConvData(data) {
-  if (data?.adultos != null && data?.criancas != null) {
-    return `${data.adultos}ad+${data.criancas}c`;
-  }
+  if (data?.adultos != null && data?.criancas != null) return `${data.adultos}ad+${data.criancas}c`;
   if (data?.pessoasTotal != null) return String(data.pessoasTotal);
   return "";
+}
+
+// HOJE (SP) para reserva parcial
+function getTodayBRDateObjInSaoPaulo() {
+  // en-CA -> YYYY-MM-DD
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Sao_Paulo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const [yyyy, mm, dd] = fmt.format(new Date()).split("-").map((x) => Number(x));
+  return { dd, mm, yyyy };
+}
+function dateObjToDataList(dateObj) {
+  const dd = String(dateObj.dd).padStart(2, "0");
+  const mm = String(dateObj.mm).padStart(2, "0");
+  const yy = String(dateObj.yyyy).slice(-2);
+  return `${dd}/${mm}/${yy}`;
 }
 
 // ===== Trello =====
@@ -746,13 +781,18 @@ async function buildConfirmMessageFromNotionOrFallback({ nome, dataList, hora, p
     )) || "";
   if (tpl.trim()) {
     const reservaBlock =
-      `RESERVA: ` + `Nome: ${nome} ` + `Data: ${dataList} ` + `N° de pessoas: ${peopleLabel} ` + `Horário: ${hora}`;
+      `RESERVA: ` +
+      `Nome: ${nome} ` +
+      `Data: ${dataList} ` +
+      `N° de pessoas: ${peopleLabel} ` +
+      `Horário: ${hora}`;
+
     if (/RESERVA:/i.test(tpl)) {
-      const replaced = tpl.replace(/RESERVA:\s*[\s\S]*$/i, reservaBlock);
-      return replaced.trim();
+      return tpl.replace(/RESERVA:\s*[\s\S]*$/i, reservaBlock).trim();
     }
     return (tpl.trim() + " " + reservaBlock).trim();
   }
+
   return (
     `Perfeito! 😊 ` +
     `Reserva confirmada: ` +
@@ -774,8 +814,7 @@ function shouldSuppressMissingRepeat(conv, missingArr) {
   const suppressMs = Math.max(5_000, Number(MISSING_REPEAT_SUPPRESS_MS || 60_000));
   const lastSig = conv?.lastMissingSig || "";
   const lastAt = Number(conv?.lastMissingAskedAt || 0);
-  if (sig === lastSig && Date.now() - lastAt < suppressMs) return true;
-  return false;
+  return sig === lastSig && Date.now() - lastAt < suppressMs;
 }
 function markMissingAsked(state, remoteJid, conv, missingArr) {
   conv.lastMissingSig = missingSignature(missingArr);
@@ -821,15 +860,26 @@ async function handleWebhook(bodyJson) {
   }
 
   // paused?
-  const pause = getConv(state, remoteJid);
-  if (pause?.handoffUntil && pause.handoffUntil > Date.now()) return;
+  const existing = getConv(state, remoteJid);
+  if (existing?.handoffUntil && existing.handoffUntil > Date.now()) return;
 
   // throttle
-  if (shouldThrottle(pause)) return;
+  if (shouldThrottle(existing)) return;
 
   await ensureKnowledgeFresh();
 
-  // ===== FIX DOMINGO: “abre hoje?” por regra (antes de Greeting/FAQ/OpenAI) =====
+  // assunto delicado => handoff inteligente
+  if (looksLikeSensitiveTopic(incomingText)) {
+    await handoffToHuman({
+      state,
+      remoteJid,
+      reason: "assunto delicado / fora do escopo (ex.: hospital/emergência/luto)",
+      incomingText,
+    });
+    return;
+  }
+
+  // FIX domingo “abre hoje?”
   if (looksLikeOpenTodayQuestion(incomingText)) {
     if (FECHADO_DOMINGO !== "0" && isSundaySaoPaulo()) {
       await evolutionSendText({
@@ -848,8 +898,10 @@ async function handleWebhook(bodyJson) {
     return;
   }
 
-  // Greeting
-  if (looksLikeGreeting(incomingText)) {
+  const inReservaFlow = existing?.mode === "reserva";
+
+  // Greeting (SÓ se NÃO estiver no fluxo de reserva)
+  if (!inReservaFlow && looksLikeGreeting(incomingText)) {
     const welcome =
       (await notionFindExactByName(NOTION_DB_RESTAURANTE, NOTION_WELCOME_NAME)) ||
       "Oieeee❤️ Aqui é a Liz! Assistente do Tsunagari. Conte comigo!";
@@ -868,9 +920,7 @@ async function handleWebhook(bodyJson) {
     return;
   }
 
-  // Order intent => notify admin
-  const existing = getConv(state, remoteJid);
-  const inReservaFlow = existing?.mode === "reserva";
+  // Order intent => notify admin (só fora de reserva)
   if (!inReservaFlow && looksLikeOrderIntent(incomingText)) {
     const from = remoteJid.split("@")[0];
     await notifyAdmin(`⚠️ POSSÍVEL PEDIDO (precisa de atendimento humano)\nCliente: ${from}\nMensagem: ${incomingText}`);
@@ -885,6 +935,22 @@ async function handleWebhook(bodyJson) {
   // Reserva flow
   if (looksLikeReservaIntent(incomingText) || inReservaFlow) {
     const conv = existing && inReservaFlow ? existing : { mode: "reserva", data: {}, startedAt: Date.now() };
+
+    // Se está esperando confirmação do limite e cliente insiste em horário impossível => handoff
+    if (conv?.awaitingHoraMaxConfirm && !isAffirmative(incomingText)) {
+      const tNew = parseTime(incomingText);
+      const insisted = looksLikeInsistence(incomingText) || (tNew && !isTimeAllowed(tNew));
+      if (insisted) {
+        await handoffToHuman({
+          state,
+          remoteJid,
+          reason: `insistência em horário fora do limite (limite=${RESERVA_HORA_MAX})`,
+          incomingText,
+        });
+        clearConv(state, remoteJid);
+        return;
+      }
+    }
 
     // confirmar hora max
     if (conv?.awaitingHoraMaxConfirm && isAffirmative(incomingText)) {
@@ -907,7 +973,14 @@ async function handleWebhook(bodyJson) {
     if (dataList) conv.data.dataList = dataList;
     if (hora) conv.data.hora = hora;
 
-    // FIX: nome “solto” dentro do fluxo de reserva
+    // NOVO: se tem hora e não tem data => assumir HOJE (SP)
+    if (!conv.data.dataList && conv.data.hora) {
+      const todayObj = getTodayBRDateObjInSaoPaulo();
+      conv.data.dateObj = todayObj;
+      conv.data.dataList = dateObjToDataList(todayObj);
+    }
+
+    // nome “solto” dentro do fluxo de reserva
     if (!conv.data.nome && looksLikeStandaloneName(incomingText)) {
       conv.data.nome = incomingText.trim();
     }
@@ -956,17 +1029,17 @@ async function handleWebhook(bodyJson) {
     if (totalNow == null) missing.push("N° de pessoas (ex.: 3 adultos e 1 criança)");
 
     if (missing.length) {
-      // FIX: não ficar repetindo a MESMA lista de faltantes
       if (shouldSuppressMissingRepeat(conv, missing)) return;
 
       const pedir = await getNotionReservaTemplate(
         "dados para a reserva",
         "Para agendar sua reserva precisamos destes dados:\nNome:\nData:\nN° de pessoas: X adultos e X crianças\nHorário:\nAssim que mandar agendamos sua reserva!"
       );
+
       if (inReservaFlow) {
         await evolutionSendText({
           remoteJid,
-          text: `Só me confirma rapidinho pra eu fechar sua reserva 😊\n${missing.map((m) => `- ${m}`).join("\n")}`,
+          text: `Para completar sua reserva só me confirma rapidinho 😊\n${missing.map((m) => `- ${m}`).join("\n")}`,
         });
       } else {
         await evolutionSendText({ remoteJid, text: pedir });
@@ -993,6 +1066,7 @@ async function handleWebhook(bodyJson) {
     // Trello capacity
     const list = await trelloEnsureList(TRELLO_BOARD_ID, conv.data.dataList);
     const counts = await trelloCountList(list.id);
+
     const maxTotal = Number(RESERVA_MAX_TOTAL_DIA);
     const max2p = Number(RESERVA_MAX_2P_DIA);
 
@@ -1041,8 +1115,8 @@ async function handleWebhook(bodyJson) {
       hora: conv.data.hora,
       peopleLabel,
     });
-    await evolutionSendText({ remoteJid, text: confirmMsg });
 
+    await evolutionSendText({ remoteJid, text: confirmMsg });
     clearConv(state, remoteJid);
     markBotReplied(state, remoteJid);
     return;
@@ -1061,8 +1135,10 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     return res.end("OK");
   }
+
   let buf = [];
   req.on("data", (c) => buf.push(c));
+
   req.on("end", async () => {
     // ACK rápido pro webhook
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
@@ -1074,12 +1150,13 @@ const server = http.createServer((req, res) => {
     } catch {
       return;
     }
+
     try {
       await handleWebhook(bodyJson);
     } catch (e) {
       const msg = e?.message || String(e);
       console.error(`[${nowIso()}] handler_error`, msg);
-      // alerta admin
+
       try {
         const remoteJid = bodyJson?.data?.key?.remoteJid || "";
         const incomingText = extractIncomingText(bodyJson);
@@ -1098,6 +1175,7 @@ const server = http.createServer((req, res) => {
   } catch (e) {
     console.error(`[${nowIso()}] initial_load_failed`, e?.message || e);
   }
+
   const PORT = Number(process.env.PORT || 3000);
-  server.listen(PORT, () => console.log(`[${nowIso()}] Tsunagari bot v2.1 (domingo-fix) on :${PORT}`));
+  server.listen(PORT, () => console.log(`[${nowIso()}] Tsunagari bot on :${PORT}`));
 })();
