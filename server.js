@@ -18,7 +18,7 @@ const path = require("path");
 const {
   // OpenAI
   OPENAI_API_KEY,
-  OPENAI_MODEL = "gpt-5.2",
+  OPENAI_MODEL = "gpt-4o",
 
   // Evolution
   EVOLUTION_SERVER_URL,
@@ -1518,7 +1518,7 @@ async function handleWebhook(bodyJson) {
   }
 
   // ===== Reserva flow =====
-  if (looksLikeReservaIntent(incomingText) || inReservaFlow) {
+  if (looksLikeReservaIntent(incomingText) || looksLikeSofaRequest(incomingText) || inReservaFlow) {
     const conv = existing && inReservaFlow ? existing : { mode: "reserva", data: {}, startedAt: Date.now() };
 
     // Se está esperando confirmação do limite e cliente insiste em horário impossível => handoff
@@ -1760,6 +1760,7 @@ async function handleWebhook(bodyJson) {
     } catch {}
 
     // pergunta consentimento de reengajamento (uma vez, pós-reserva)
+    let askedReengagement = false;
     try {
       const telefone = remoteJid.split("@")[0];
       const page = await notionFindClientePageByTelefone(telefone);
@@ -1770,14 +1771,13 @@ async function handleWebhook(bodyJson) {
           "CONSENT_REENGAJAMENTO_PERGUNTA",
           "Posso te mandar uma mensagem de vez em quando pra facilitar uma nova reserva? (sim/não)"
         );
-        const c2 = getConv(state, remoteJid) || { mode: null, data: {} };
-        c2.pendingReengagementConsent = true;
-        c2.pendingReengagementAskedAt = Date.now();
+        const c2 = { mode: null, data: {}, pendingReengagementConsent: true, pendingReengagementAskedAt: Date.now() };
         setConv(state, remoteJid, c2);
         await evolutionSendText({ remoteJid, text: ask });
+        askedReengagement = true;
       }
     } catch {}
-    clearConv(state, remoteJid);
+    if (!askedReengagement) clearConv(state, remoteJid);
     markBotReplied(state, remoteJid);
     return;
   }
