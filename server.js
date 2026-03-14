@@ -74,6 +74,14 @@ const {
   MAX_ADVANCE_DAYS = "120",
 } = process.env;
 
+// ===== Mesas (regras internas) =====
+// Observação: a alocação é interna; o cliente não deve receber detalhes de "melhor lugar" etc.
+const TABLES = {
+  round: { count: 3, min: 6, max: 11, labelName: "mesa:redonda", labelColor: "blue" },
+  sofa: { count: 5, min: 2, max: 5, labelName: "mesa:sofa", labelColor: "green" },
+  normal: { count: 2, min: 2, max: 7, labelName: "mesa:normal", labelColor: "yellow" },
+};
+
 // ===== Helpers =====
 function must(name, val) {
   if (!val) throw new Error(`Falta ${name} nas Environment Variables do EasyPanel`);
@@ -103,6 +111,12 @@ function looksLikeReservaIntent(text) {
     t.includes("agendar") ||
     t.includes("marcar")
   );
+}
+function looksLikeSofaRequest(text) {
+  // Pedido EXPLÍCITO de mesa de sofazinho/sofá.
+  // (Não confundir com a palavra "mesa" genérica.)
+  const t = normalizeText(text);
+  return /\b(sofazinho|sofazinhozinho|sofa|sof[aá])\b/.test(t);
 }
 function looksLikeOrderIntent(text) {
   const t = normalizeText(text);
@@ -743,17 +757,27 @@ async function notifyHumans(text) {
  * Handoff inteligente:
  * - chama humanos (HUMAN_NUMBERS + ADMIN_WHATSAPP)
  * - manda msg pro cliente
- * - NÃO pausa o chat (pause continua sendo só via fromMe=true)
+ * - PAUSA o chat por HANDOFF_MINUTES (para o bot não ficar atrapalhando)
+ * - NÃO cria card no Trello
  */
 async function handoffToHuman({ state, remoteJid, reason, incomingText }) {
   const from = remoteJid.split("@")[0];
+
   await evolutionSendText({
     remoteJid,
-    text: "Entendi. Só um instante que vou chamar alguém da equipe pra te ajudar direitinho por aqui. 🙏",
+    text: "Entendi. Só um instante que vou chamar um atendente pra te ajudar direitinho por aqui. 🙏",
   });
+
   const alert = `🙋 ATENDIMENTO HUMANO Motivo: ${reason} Cliente: ${from} Mensagem: ${incomingText}`;
   await notifyHumans(alert);
   await notifyAdmin(alert);
+
+  // pausa conversa
+  const mins = Math.max(5, Number(HANDOFF_MINUTES || 180));
+  const c = { mode: null, data: {} };
+  setConv(state, remoteJid, c);
+  setHandoffPause(state, remoteJid, mins);
+
   markBotReplied(state, remoteJid);
 }
 
@@ -1118,11 +1142,97 @@ async function trelloCountList(listId) {
   return { total, twoP };
 }
 
-async function trelloCreateReservaCard({ listId, nome, hora, pessoasTotal, telefone }) {
+let TRELLO_LABEL_CACHE = null; // { byName: Map(name->id) }
+
+async function trelloGetBoardLabels(boardId) {
+  const labels = await trelloGet(`https://api.trello.com/1/boards/${boardId}/labels?limit=1000&fields=name,color`);
+  const byName = new Map();
+  for (const l of labels || []) byName.set(String(l.name || "").trim(), l.id);
+  return { labels, byName };
+}
+
+async function trelloEnsureLabel(boardId, name, color) {
+  if (!TRELLO_LABEL_CACHE) TRELLO_LABEL_CACHE = await trelloGetBoardLabels(boardId);
+  const hit = TRELLO_LABEL_CACHE.byName.get(name);
+  if (hit) return hit;
+
+  const created = await trelloPost(
+    `https://api.trello.com/1/labels?idBoard=${boardId}&name=${encodeURIComponent(name)}&color=${encodeURIComponent(color || "blue")}`,
+    null
+  );
+  TRELLO_LABEL_CACHE.byName.set(name, created.id);
+  return created.id;
+}
+
+async function trelloGetMesaLabelIds(boardId) {
+  return {
+    round: await trelloEnsureLabel(boardId, TABLES.round.labelName, TABLES.round.labelColor),
+    sofa: await trelloEnsureLabel(boardId, TABLES.sofa.labelName, TABLES.sofa.labelColor),
+    normal: await trelloEnsureLabel(boardId, TABLES.normal.labelName, TABLES.normal.labelColor),
+  };
+}
+
+async function trelloCountListWithMesas(listId, boardId) {
+  const labelIds = await trelloGetMesaLabelIds(boardId);
+  const cards = await trelloGet(`https://api.trello.com/1/lists/${listId}/cards?fields=name,idLabels&limit=1000`);
+
+  const total = (cards || []).length;
+  const twoP = (cards || []).filter((c) => parsePeopleFromCardName(c.name) === 2).length;
+
+  let round = 0, sofa = 0, normal = 0;
+  for (const c of cards || []) {
+    const ids = c.idLabels || [];
+    if (ids.includes(labelIds.round)) round++;
+    if (ids.includes(labelIds.sofa)) sofa++;
+    if (ids.includes(labelIds.normal)) normal++;
+  }
+
+  return { total, twoP, mesas: { round, sofa, normal }, labelIds };
+}
+
+function pickMesaType({ pessoasTotal, counts }) {
+  const n = Number(pessoasTotal);
+  if (!Number.isFinite(n) || n <= 0) return null;
+
+  const avail = {
+    round: counts.mesas.round < TABLES.round.count,
+    sofa: counts.mesas.sofa < TABLES.sofa.count,
+    normal: counts.mesas.normal < TABLES.normal.count,
+  };
+
+  // 2–5: SOFA, senão NORMAL
+  if (n >= 2 && n <= 5) {
+    if (avail.sofa) return "sofa";
+    if (avail.normal) return "normal";
+    return null;
+  }
+
+  // 6–7: REDONDA, senão NORMAL
+  if (n >= 6 && n <= 7) {
+    if (avail.round) return "round";
+    if (avail.normal) return "normal";
+    return null;
+  }
+
+  // 8–11: REDONDA
+  if (n >= 8 && n <= 11) {
+    if (avail.round) return "round";
+    return null;
+  }
+
+  return null; // 1 pessoa ou 12+ sai do fluxo convencional
+}
+
+async function trelloCreateReservaCard({ listId, boardId, mesaType, nome, hora, pessoasTotal, telefone }) {
   const pessoasLabel = `${Number(pessoasTotal)}p`;
   const title = `${nome} - ${hora} - ${pessoasLabel}`;
   const desc = `Telefone/WhatsApp: ${telefone}`;
-  return await trelloPost(`https://api.trello.com/1/cards?idList=${listId}`, { name: title, desc });
+
+  const mesaLabelIds = await trelloGetMesaLabelIds(boardId);
+  const idLabels = [];
+  if (mesaType && mesaLabelIds[mesaType]) idLabels.push(mesaLabelIds[mesaType]);
+
+  return await trelloPost(`https://api.trello.com/1/cards?idList=${listId}`, { name: title, desc, idLabels });
 }
 
 // ===== Templates (Notion) =====
@@ -1422,7 +1532,6 @@ async function handleWebhook(bodyJson) {
           reason: `insistência em horário fora do limite (limite=${RESERVA_HORA_MAX})`,
           incomingText,
         });
-        clearConv(state, remoteJid);
         return;
       }
     }
@@ -1446,6 +1555,9 @@ async function handleWebhook(bodyJson) {
     if (nomeSmart) conv.data.nome = nomeSmart;
     if (dataList) conv.data.dataList = dataList;
     if (hora) conv.data.hora = hora;
+
+    const pediuSofa = looksLikeSofaRequest(incomingText);
+    if (pediuSofa) conv.data.pediuSofa = true;
 
     // Reserva parcial: se tem hora e não tem data => assumir HOJE (SP)
     if (!conv.data.dataList && conv.data.hora) {
@@ -1538,11 +1650,43 @@ async function handleWebhook(bodyJson) {
 
     // Trello capacity
     const list = await trelloEnsureList(TRELLO_BOARD_ID, conv.data.dataList);
-    const counts = await trelloCountList(list.id);
+    const counts = await trelloCountListWithMesas(list.id, TRELLO_BOARD_ID);
     const maxTotal = Number(RESERVA_MAX_TOTAL_DIA);
-    const max2p = Number(RESERVA_MAX_2P_DIA);
+    const n = Number(conv.data.pessoasTotal);
 
+    // Gatilho: 12+ pessoas => handoff
+    if (n >= 12) {
+      await handoffToHuman({
+        state,
+        remoteJid,
+        reason: `grupo grande (${n} pessoas) — requer atendimento manual`,
+        incomingText,
+      });
+      return;
+    }
+
+    // Gatilho: pediu sofá explicitamente => handoff
+    if (conv.data.pediuSofa) {
+      await handoffToHuman({
+        state,
+        remoteJid,
+        reason: "cliente pediu sofazinho/sofá — alocação manual necessária",
+        incomingText,
+      });
+      return;
+    }
+
+    // Capacidade total atingida
     if (counts.total >= maxTotal) {
+      if (n >= 6) {
+        await handoffToHuman({
+          state,
+          remoteJid,
+          reason: `capacidade total atingida para grupo grande (${n} pessoas)`,
+          incomingText,
+        });
+        return;
+      }
       const msg = await getTemplate(
         "RESERVA_SEM_VAGAS",
         "❗ Já atingimos o limite de reservas para esse dia. Você pode vir sem reserva, por ordem de chegada. 😊"
@@ -1553,8 +1697,8 @@ async function handleWebhook(bodyJson) {
       return;
     }
 
-    const isTwoPeople = Number(conv.data.pessoasTotal) === 2;
-    if (isTwoPeople && counts.twoP >= max2p) {
+    // Limite 2 pessoas
+    if (n === 2 && counts.twoP >= Number(RESERVA_MAX_2P_DIA)) {
       await evolutionSendText({
         remoteJid,
         text: "Hoje já atingimos o limite de reservas para 2 pessoas. 😊 Mas você pode vir sem reserva por ordem de chegada. 🍣✨",
@@ -1564,10 +1708,34 @@ async function handleWebhook(bodyJson) {
       return;
     }
 
+    // Escolher mesa
+    const mesaType = pickMesaType({ pessoasTotal: n, counts });
+    if (!mesaType) {
+      if (n >= 6) {
+        await handoffToHuman({
+          state,
+          remoteJid,
+          reason: `sem mesa disponível para ${n} pessoas`,
+          incomingText,
+        });
+        return;
+      }
+      const msg = await getTemplate(
+        "RESERVA_SEM_VAGAS",
+        "❗ Já atingimos o limite de reservas para esse dia. Você pode vir sem reserva, por ordem de chegada. 😊"
+      );
+      await evolutionSendText({ remoteJid, text: msg });
+      clearConv(state, remoteJid);
+      markBotReplied(state, remoteJid);
+      return;
+    }
+
     // Create card
     const telefone = remoteJid.split("@")[0];
     await trelloCreateReservaCard({
       listId: list.id,
+      boardId: TRELLO_BOARD_ID,
+      mesaType,
       nome: conv.data.nome,
       hora: conv.data.hora,
       pessoasTotal: conv.data.pessoasTotal,
