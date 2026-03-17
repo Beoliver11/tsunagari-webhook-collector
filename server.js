@@ -1378,8 +1378,9 @@ async function handleWebhook(bodyJson) {
   await ensureTemplatesFresh();
 
   // Captura aniversário: só quando a mensagem contém “aniversário” + data DD/MM
+  // e NÃO está dentro do fluxo de reserva (evita interceptar “reserva pra meu aniversário 15/06”)
   try {
-    if (/aniversari/i.test(incomingText)) {
+    if (/aniversari/i.test(incomingText) && existing?.mode !== “reserva”) {
       const ddmm = parseBirthdayDDMM(incomingText);
       if (ddmm) {
         const conv0 = getConv(state, remoteJid) || { mode: null, data: {} };
