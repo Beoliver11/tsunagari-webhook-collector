@@ -414,6 +414,18 @@ function buildClientePropsPatch(patch) {
   if (patch.ultimaReservaISO != null) {
     props["Última reserva"] = { date: { start: patch.ultimaReservaISO } };
   }
+  if (patch.ultimoReengajamentoISO != null) {
+    props["Último reengajamento enviado"] = { date: { start: patch.ultimoReengajamentoISO } };
+  }
+  if (patch.aniversarioDDMM != null) {
+    props["Aniversário (DD/MM)"] = { rich_text: [{ text: { content: String(patch.aniversarioDDMM) } }] };
+  }
+  if (patch.consentAniversario != null) {
+    props["Consentimento Aniversário"] = { checkbox: Boolean(patch.consentAniversario) };
+  }
+  if (patch.ultimoAniversarioAno != null) {
+    props["Último aniversário enviado (ano)"] = { number: Number(patch.ultimoAniversarioAno) };
+  }
   if (patch.optOut != null) {
     props["Opt-out"] = { checkbox: Boolean(patch.optOut) };
   }
@@ -516,6 +528,70 @@ async function queryClientesForProactive() {
   return pages;
 }
 
+
+async function runBirthdayJob() {
+  const today = todayDDMMInSaoPaulo();
+  const yearNum = Number(
+    new Intl.DateTimeFormat("en-CA", { timeZone: "America/Sao_Paulo", year: "numeric" }).format(new Date())
+  );
+
+  const pages = await queryClientesForProactive();
+  const tpl = await getTemplate(
+    "ANIVERSARIO_MSG",
+    "Feliz aniversário! 🎉\nA Liz aqui, em nome da equipe do Tsunagari.\nQuando quiser, é só me chamar pra reservar 🍣✨"
+  );
+
+  let sent = 0;
+  for (const page of pages) {
+    const tel = notionTextFromProp(notionPickProp(page, ["Telefone"]))?.trim();
+    const ddmm = notionTextFromProp(page.properties?.["Aniversário (DD/MM)"])?.trim();
+    const consent = page.properties?.["Consentimento Aniversário"]?.checkbox === true;
+    const lastYear = page.properties?.["Último aniversário enviado (ano)"]?.number;
+
+    if (!tel) continue;
+    if (!consent) continue;
+    if (ddmm !== today) continue;
+    if (Number(lastYear) === yearNum) continue;
+
+    await evolutionSendText({ remoteJid: `${tel}@s.whatsapp.net`, text: tpl });
+    await upsertClienteByTelefone(tel, { ultimoAniversarioAno: yearNum });
+    sent += 1;
+  }
+  return sent;
+}
+
+async function runReengagementJob() {
+  const todayISO = todayISOInSaoPaulo();
+  const pages = await queryClientesForProactive();
+
+  const tpl = await getTemplate(
+    "REENGAJAMENTO_29D_MSG",
+    "Oii! A Liz aqui, em nome da equipe do Tsunagari 😊\nFaz um tempinho que você não vem… vai deixar fazer 30? 🍣✨\nQuer que eu faça uma reserva pra essa semana?"
+  );
+
+  let sent = 0;
+  for (const page of pages) {
+    const tel = notionTextFromProp(notionPickProp(page, ["Telefone"]))?.trim();
+    if (!tel) continue;
+
+    const ultimaReserva = page.properties?.["Última reserva"]?.date?.start;
+    if (!ultimaReserva) continue;
+
+    const lastSent = page.properties?.["Último reengajamento enviado"]?.date?.start;
+    if (lastSent) {
+      const sinceLast = daysBetweenISO(lastSent.slice(0, 10), todayISO);
+      if (sinceLast < 29) continue;
+    }
+
+    const days = daysBetweenISO(ultimaReserva.slice(0, 10), todayISO);
+    if (days < 29) continue;
+
+    await evolutionSendText({ remoteJid: `${tel}@s.whatsapp.net`, text: tpl });
+    await upsertClienteByTelefone(tel, { ultimoReengajamentoISO: todayISO });
+    sent += 1;
+  }
+  return sent;
+}
 
 async function notionFindExactTextByTitleFlexible(dbId, title, { textPropCandidates } = {}) {
   const r = await fetch(`https://api.notion.com/v1/databases/${dbId}/query`, {
@@ -1301,6 +1377,27 @@ async function handleWebhook(bodyJson) {
   // Templates cache
   await ensureTemplatesFresh();
 
+  // Captura aniversário: só quando a mensagem contém “aniversário” + data DD/MM
+  try {
+    if (/aniversari/i.test(incomingText)) {
+      const ddmm = parseBirthdayDDMM(incomingText);
+      if (ddmm) {
+        const conv0 = getConv(state, remoteJid) || { mode: null, data: {} };
+        if (!conv0.pendingBirthdayDDMM) {
+          conv0.pendingBirthdayDDMM = ddmm;
+          setConv(state, remoteJid, conv0);
+          const ask = await getTemplate(
+            “CONSENT_ANIVERSARIO_PERGUNTA”,
+            `Posso anotar seu aniversário (${ddmm}) e te mandar parabéns nesse dia?`
+          );
+          await evolutionSendText({ remoteJid, text: ask });
+          markBotReplied(state, remoteJid);
+          return;
+        }
+      }
+    }
+  } catch {}
+
   // FIX domingo “abre hoje?”
   if (looksLikeOpenTodayQuestion(incomingText)) {
     if (FECHADO_DOMINGO !== "0" && isSundaySaoPaulo()) {
@@ -1321,6 +1418,30 @@ async function handleWebhook(bodyJson) {
   }
 
   const inReservaFlow = existing?.mode === "reserva";
+
+  // Confirmação de aniversário (sim/não após pergunta da Liz)
+  if (existing?.pendingBirthdayDDMM) {
+    if (isAffirmative(incomingText)) {
+      const telefone = remoteJid.split("@")[0];
+      await upsertClienteByTelefone(telefone, {
+        aniversarioDDMM: existing.pendingBirthdayDDMM,
+        consentAniversario: true,
+      });
+      existing.pendingBirthdayDDMM = null;
+      setConv(state, remoteJid, existing);
+      await evolutionSendText({ remoteJid, text: "Perfeito! Já anotei 😊" });
+      markBotReplied(state, remoteJid);
+      return;
+    }
+    const tNeg = normalizeText(incomingText);
+    if (/\b(nao|não|negativo|n)\b/.test(tNeg)) {
+      existing.pendingBirthdayDDMM = null;
+      setConv(state, remoteJid, existing);
+      await evolutionSendText({ remoteJid, text: "Tudo bem 😊" });
+      markBotReplied(state, remoteJid);
+      return;
+    }
+  }
 
   // Greeting (SÓ se NÃO estiver em reserva)
   if (!inReservaFlow && looksLikeGreeting(incomingText)) {
@@ -1638,7 +1759,10 @@ const server = http.createServer((req, res) => {
         must("EVOLUTION_APIKEY", EVOLUTION_APIKEY);
         if (!NOTION_DB_CLIENTES) throw new Error("NOTION_DB_CLIENTES não configurado");
 
-        console.log(`[${nowIso()}] jobs/daily done (birthday/reengagement disabled)`);
+        await ensureTemplatesFresh();
+        const b = await runBirthdayJob();
+        const r = await runReengagementJob();
+        console.log(`[${nowIso()}] jobs/daily done birthday=${b} reengagement=${r}`);
       } catch (e) {
         console.error(`[${nowIso()}] jobs/daily error`, e?.message || e);
         try {
