@@ -414,26 +414,11 @@ function buildClientePropsPatch(patch) {
   if (patch.ultimaReservaISO != null) {
     props["Última reserva"] = { date: { start: patch.ultimaReservaISO } };
   }
-  if (patch.ultimoReengajamentoISO != null) {
-    props["Último reengajamento enviado"] = { date: { start: patch.ultimoReengajamentoISO } };
-  }
-  if (patch.aniversarioDDMM != null) {
-    props["Aniversário (DD/MM)"] = { rich_text: [{ text: { content: String(patch.aniversarioDDMM) } }] };
-  }
-  if (patch.consentAniversario != null) {
-    props["Consentimento Aniversário"] = { checkbox: Boolean(patch.consentAniversario) };
-  }
-  if (patch.consentReengajamento != null) {
-    props["Consentimento Reengajamento"] = { checkbox: Boolean(patch.consentReengajamento) };
-  }
   if (patch.optOut != null) {
     props["Opt-out"] = { checkbox: Boolean(patch.optOut) };
   }
   if (patch.ativo != null) {
     props["Ativo"] = { checkbox: Boolean(patch.ativo) };
-  }
-  if (patch.ultimoAniversarioAno != null) {
-    props["Último aniversário enviado (ano)"] = { number: Number(patch.ultimoAniversarioAno) };
   }
   return props;
 }
@@ -531,72 +516,6 @@ async function queryClientesForProactive() {
   return pages;
 }
 
-async function runBirthdayJob() {
-  const today = todayDDMMInSaoPaulo();
-  const yearNum = Number(
-    new Intl.DateTimeFormat("en-CA", { timeZone: "America/Sao_Paulo", year: "numeric" }).format(new Date())
-  );
-
-  const pages = await queryClientesForProactive();
-  const tpl = await getTemplate(
-    "ANIVERSARIO_MSG",
-    "Feliz aniversário! 🎉\nA Liz aqui, em nome da equipe do Tsunagari.\nQuando quiser, é só me chamar pra reservar 🍣✨"
-  );
-
-  let sent = 0;
-  for (const page of pages) {
-    const tel = notionTextFromProp(notionPickProp(page, ["Telefone"]))?.trim();
-    const ddmm = notionTextFromProp(page.properties?.["Aniversário (DD/MM)"])?.trim();
-    const consent = page.properties?.["Consentimento Aniversário"]?.checkbox === true;
-    const lastYear = page.properties?.["Último aniversário enviado (ano)"]?.number;
-
-    if (!tel) continue;
-    if (!consent) continue;
-    if (ddmm !== today) continue;
-    if (Number(lastYear) == yearNum) continue;
-
-    await evolutionSendText({ remoteJid: `${tel}@s.whatsapp.net`, text: tpl });
-    await upsertClienteByTelefone(tel, { ultimoAniversarioAno: yearNum });
-    sent += 1;
-  }
-  return sent;
-}
-
-async function runReengagementJob() {
-  const todayISO = todayISOInSaoPaulo();
-  const pages = await queryClientesForProactive();
-
-  const tpl = await getTemplate(
-    "REENGAJAMENTO_29D_MSG",
-    "Oii! A Liz aqui, em nome da equipe do Tsunagari 😊\nFaz um tempinho que você não vem… vai deixar fazer 30? 🍣✨\nQuer que eu faça uma reserva pra essa semana?"
-  );
-
-  let sent = 0;
-  for (const page of pages) {
-    const tel = notionTextFromProp(notionPickProp(page, ["Telefone"]))?.trim();
-    if (!tel) continue;
-
-    const consent = page.properties?.["Consentimento Reengajamento"]?.checkbox === true;
-    if (!consent) continue;
-
-    const ultimaReserva = page.properties?.["Última reserva"]?.date?.start;
-    if (!ultimaReserva) continue;
-
-    const lastSent = page.properties?.["Último reengajamento enviado"]?.date?.start;
-    if (lastSent) {
-      const sinceLast = daysBetweenISO(lastSent.slice(0, 10), todayISO);
-      if (sinceLast < 29) continue;
-    }
-
-    const days = daysBetweenISO(ultimaReserva.slice(0, 10), todayISO);
-    if (days < 29) continue;
-
-    await evolutionSendText({ remoteJid: `${tel}@s.whatsapp.net`, text: tpl });
-    await upsertClienteByTelefone(tel, { ultimoReengajamentoISO: todayISO });
-    sent += 1;
-  }
-  return sent;
-}
 
 async function notionFindExactTextByTitleFlexible(dbId, title, { textPropCandidates } = {}) {
   const r = await fetch(`https://api.notion.com/v1/databases/${dbId}/query`, {
@@ -1382,25 +1301,6 @@ async function handleWebhook(bodyJson) {
   // Templates cache
   await ensureTemplatesFresh();
 
-  // Captura aniversário (DD/MM) com consentimento
-  try {
-    const ddmm = parseBirthdayDDMM(incomingText);
-    if (ddmm) {
-      const conv0 = getConv(state, remoteJid) || { mode: null, data: {} };
-      if (!conv0.pendingBirthdayDDMM) {
-        conv0.pendingBirthdayDDMM = ddmm;
-        setConv(state, remoteJid, conv0);
-        const ask = await getTemplate(
-          "CONSENT_ANIVERSARIO_PERGUNTA",
-          `Posso anotar seu aniversário (${ddmm}) e te mandar uma mensagem de parabéns nesse dia? (sim/não)`
-        );
-        await evolutionSendText({ remoteJid, text: ask });
-        markBotReplied(state, remoteJid);
-        return;
-      }
-    }
-  } catch {}
-
   // FIX domingo “abre hoje?”
   if (looksLikeOpenTodayQuestion(incomingText)) {
     if (FECHADO_DOMINGO !== "0" && isSundaySaoPaulo()) {
@@ -1421,57 +1321,6 @@ async function handleWebhook(bodyJson) {
   }
 
   const inReservaFlow = existing?.mode === "reserva";
-
-  // Confirmação de consentimento de reengajamento
-  if (existing?.pendingReengagementConsent) {
-    const askedAt = Number(existing.pendingReengagementAskedAt || 0);
-    if (Date.now() - askedAt < 10 * 60 * 1000) {
-      if (isAffirmative(incomingText)) {
-        const telefone = remoteJid.split("@")[0];
-        await upsertClienteByTelefone(telefone, { consentReengajamento: true });
-        existing.pendingReengagementConsent = null;
-        setConv(state, remoteJid, existing);
-        await evolutionSendText({ remoteJid, text: "Fechado! 😊" });
-        markBotReplied(state, remoteJid);
-        return;
-      }
-      const t = normalizeText(incomingText);
-      if (/\b(nao|não|negativo|n)\b/.test(t)) {
-        existing.pendingReengagementConsent = null;
-        setConv(state, remoteJid, existing);
-        await evolutionSendText({ remoteJid, text: "Tudo bem 😊" });
-        markBotReplied(state, remoteJid);
-        return;
-      }
-    } else {
-      existing.pendingReengagementConsent = null;
-      setConv(state, remoteJid, existing);
-    }
-  }
-
-  // Confirmação de consentimento de aniversário
-  if (existing?.pendingBirthdayDDMM) {
-    if (isAffirmative(incomingText)) {
-      const telefone = remoteJid.split("@")[0];
-      await upsertClienteByTelefone(telefone, {
-        aniversarioDDMM: existing.pendingBirthdayDDMM,
-        consentAniversario: true,
-      });
-      existing.pendingBirthdayDDMM = null;
-      setConv(state, remoteJid, existing);
-      await evolutionSendText({ remoteJid, text: "Perfeito! Já deixei anotado 😊" });
-      markBotReplied(state, remoteJid);
-      return;
-    }
-    const t = normalizeText(incomingText);
-    if (/\b(nao|não|negativo|n)\b/.test(t)) {
-      existing.pendingBirthdayDDMM = null;
-      setConv(state, remoteJid, existing);
-      await evolutionSendText({ remoteJid, text: "Tudo bem 😊" });
-      markBotReplied(state, remoteJid);
-      return;
-    }
-  }
 
   // Greeting (SÓ se NÃO estiver em reserva)
   if (!inReservaFlow && looksLikeGreeting(incomingText)) {
@@ -1759,25 +1608,7 @@ async function handleWebhook(bodyJson) {
       if (iso) await upsertClienteByTelefone(telefone, { ultimaReservaISO: iso });
     } catch {}
 
-    // pergunta consentimento de reengajamento (uma vez, pós-reserva)
-    let askedReengagement = false;
-    try {
-      const telefone = remoteJid.split("@")[0];
-      const page = await notionFindClientePageByTelefone(telefone);
-      const already = page?.properties?.["Consentimento Reengajamento"]?.checkbox === true;
-      const optout = page?.properties?.["Opt-out"]?.checkbox === true;
-      if (!already && !optout) {
-        const ask = await getTemplate(
-          "CONSENT_REENGAJAMENTO_PERGUNTA",
-          "Posso te mandar uma mensagem de vez em quando pra facilitar uma nova reserva? (sim/não)"
-        );
-        const c2 = { mode: null, data: {}, pendingReengagementConsent: true, pendingReengagementAskedAt: Date.now() };
-        setConv(state, remoteJid, c2);
-        await evolutionSendText({ remoteJid, text: ask });
-        askedReengagement = true;
-      }
-    } catch {}
-    if (!askedReengagement) clearConv(state, remoteJid);
+    clearConv(state, remoteJid);
     markBotReplied(state, remoteJid);
     return;
   }
@@ -1807,10 +1638,7 @@ const server = http.createServer((req, res) => {
         must("EVOLUTION_APIKEY", EVOLUTION_APIKEY);
         if (!NOTION_DB_CLIENTES) throw new Error("NOTION_DB_CLIENTES não configurado");
 
-        await ensureTemplatesFresh();
-        const b = await runBirthdayJob();
-        const r = await runReengagementJob();
-        console.log(`[${nowIso()}] jobs/daily done birthday=${b} reengagement=${r}`);
+        console.log(`[${nowIso()}] jobs/daily done (birthday/reengagement disabled)`);
       } catch (e) {
         console.error(`[${nowIso()}] jobs/daily error`, e?.message || e);
         try {
