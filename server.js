@@ -1380,7 +1380,7 @@ async function handleWebhook(bodyJson) {
   // Captura aniversário: só quando a mensagem contém “aniversário” + data DD/MM
   // e NÃO está dentro do fluxo de reserva (evita interceptar “reserva pra meu aniversário 15/06”)
   try {
-    if (/aniversari/i.test(incomingText) && existing?.mode !== “reserva”) {
+    if (/aniversari/i.test(incomingText) && existing?.mode !== "reserva") {
       const ddmm = parseBirthdayDDMM(incomingText);
       if (ddmm) {
         const conv0 = getConv(state, remoteJid) || { mode: null, data: {} };
@@ -1388,7 +1388,7 @@ async function handleWebhook(bodyJson) {
           conv0.pendingBirthdayDDMM = ddmm;
           setConv(state, remoteJid, conv0);
           const ask = await getTemplate(
-            “CONSENT_ANIVERSARIO_PERGUNTA”,
+            "CONSENT_ANIVERSARIO_PERGUNTA",
             `Posso anotar seu aniversário (${ddmm}) e te mandar parabéns nesse dia?`
           );
           await evolutionSendText({ remoteJid, text: ask });
