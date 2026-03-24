@@ -42,8 +42,6 @@ const {
   // NOVO (recomendado): Notion DBs por função
   NOTION_DB_FAQ = "2bf12169-2df7-806a-82cc-d8c1c3e39202", // DB — FAQ (Respostas)
   NOTION_DB_TEMPLATES = "516f3fa8-2a01-473d-ab97-e77c51ab4ae7", // DB — Templates (Mensagens prontas)
-  NOTION_DB_REGRAS_SOP = "7501bc29-7b0b-40e5-806c-23b43e56ad40", // DB — Regras (SOP)
-  NOTION_DB_LINKS = "9269b2de-6d30-4f64-9f57-64feb7f9a371", // DB — Links & Contatos
   NOTION_DB_CARDAPIO = "", // opcional
 
   // Antigo (compat): caso você ainda use os DBs antigos
@@ -338,13 +336,13 @@ async function notionFindExactTextByTitleFlexible(dbId, title, { textPropCandida
   });
 
   // Se o DB novo não tem propriedade "Nome", a query acima falha. Vamos fazer fallback sem filtro.
-  const j = await r.json().catch(() => ({}));
   if (!r.ok) {
     // fallback: varrer e achar por name
     const rows = await notionQueryAllRowsFlexible(dbId, 100);
     const hit = rows.find((x) => normalizeText(x.name) === normalizeText(title));
     return hit?.text?.trim() || null;
   }
+  const j = await r.json().catch(() => ({}));
 
   const page = j.results?.[0];
   if (!page) return null;
@@ -474,7 +472,11 @@ async function notifyHumans(text) {
   const nums = parseHumanNumbers();
   if (!nums.length) return;
   for (const num of nums) {
-    await evolutionSendText({ remoteJid: `${num}@s.whatsapp.net`, text });
+    try {
+      await evolutionSendText({ remoteJid: `${num}@s.whatsapp.net`, text });
+    } catch (e) {
+      console.error(`[${nowIso()}] human_notify_failed num=${num}`, e?.message || e);
+    }
   }
 }
 
@@ -494,8 +496,12 @@ async function handoffToHuman({ state, remoteJid, reason, incomingText }) {
   });
 
   const alert = `🙋 ATENDIMENTO HUMANO Motivo: ${reason} Cliente: ${from} Mensagem: ${incomingText}`;
-  await notifyHumans(alert);
-  await notifyAdmin(alert);
+  try {
+    await notifyHumans(alert);
+    await notifyAdmin(alert);
+  } catch (e) {
+    console.error(`[${nowIso()}] handoff_notify_failed`, e?.message || e);
+  }
 
   // pausa conversa
   const mins = Math.max(5, Number(HANDOFF_MINUTES || 180));
@@ -822,7 +828,11 @@ async function trelloGet(url) {
   const r = await fetch(full.toString());
   const t = await r.text();
   if (!r.ok) throw new Error(`Trello GET failed ${r.status}: ${t}`);
-  return JSON.parse(t);
+  try {
+    return JSON.parse(t);
+  } catch {
+    throw new Error(`Trello GET invalid JSON (${r.status}): ${t.slice(0, 200)}`);
+  }
 }
 async function trelloPost(url, bodyObj) {
   const full = new URL(url);
@@ -835,7 +845,11 @@ async function trelloPost(url, bodyObj) {
   });
   const t = await r.text();
   if (!r.ok) throw new Error(`Trello POST failed ${r.status}: ${t}`);
-  return JSON.parse(t);
+  try {
+    return JSON.parse(t);
+  } catch {
+    throw new Error(`Trello POST invalid JSON (${r.status}): ${t.slice(0, 200)}`);
+  }
 }
 async function trelloFindListByName(boardId, listName) {
   const lists = await trelloGet(`https://api.trello.com/1/boards/${boardId}/lists?fields=name,closed&limit=1000`);
@@ -858,13 +872,6 @@ function parsePeopleFromCardName(name) {
   const m3 = (name || "").match(/-\s*(\d{1,2})\s*ad\+\s*(\d{1,2})\s*c\s*$/i);
   if (m3) return Number(m3[1]) + Number(m3[2]);
   return null;
-}
-
-async function trelloCountList(listId) {
-  const cards = await trelloGet(`https://api.trello.com/1/lists/${listId}/cards?fields=name&limit=1000`);
-  const total = cards.length;
-  const twoP = cards.filter((c) => parsePeopleFromCardName(c.name) === 2).length;
-  return { total, twoP };
 }
 
 let TRELLO_LABEL_CACHE = null; // { byName: Map(name->id) }
