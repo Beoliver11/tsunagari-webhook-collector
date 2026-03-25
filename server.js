@@ -200,7 +200,7 @@ function looksLikeInsistence(text) {
 }
 
 // ======== Persistent state (file) ========
-const STATE_PATH = path.join(process.cwd(), "state.json");
+const STATE_PATH = process.env.STATE_PATH || path.join(__dirname, "state.json");
 function loadState() {
   try {
     return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
@@ -688,14 +688,17 @@ function daysFromTodayBR(dateObj) {
 
 function parseTime(text) {
   const m = text.match(/\b([01]?\d|2[0-3])[:h]([0-5]\d)\b/);
-  if (!m) return null;
-  return `${m[1].padStart(2, "0")}:${m[2]}`;
+  if (m) return `${m[1].padStart(2, "0")}:${m[2]}`;
+  // "19h" sem minutos
+  const m2 = text.match(/\b([01]?\d|2[0-3])h\b/i);
+  if (m2) return `${m2[1].padStart(2, "0")}:00`;
+  return null;
 }
 
 function parseName(text) {
-  const m = text.match(/nome\s*[:\-]\s*([^\r ]+)\s*$/i);
+  const m = text.match(/nome\s*[:\-]\s*([^\r\n]+)/i);
   if (m) return m[1].trim();
-  const m2 = text.match(/no nome de\s+([^\r ]+)\s*$/i);
+  const m2 = text.match(/no nome de\s+([^\r\n]+)/i);
   if (m2) return m2[1].trim();
   return null;
 }
@@ -732,16 +735,16 @@ function looksLikeStandaloneName(text) {
   const raw = (text || "").trim();
   if (!raw) return false;
   if (/\d/.test(raw)) return false;
-  if (raw.length < 4 || raw.length > 60) return false;
+  if (raw.length < 2 || raw.length > 60) return false;
 
   const t = normalizeText(raw);
   if (/\b(reserva|reservar|mesa|amanha|hoje|horario|horário|pessoas|adultos|criancas|crianças)\b/.test(t))
     return false;
 
   const words = raw.split(/\s+/).filter(Boolean);
-  if (words.length < 2 || words.length > 5) return false;
+  if (words.length < 1 || words.length > 5) return false;
 
-  if (!/^[A-Za-zÀ-ÿ'.-]+(\s+[A-Za-zÀ-ÿ'.-]+)+$/.test(raw)) return false;
+  if (!/^[A-Za-zÀ-ÿ'.-]+(\s+[A-Za-zÀ-ÿ'.-]+)*$/.test(raw)) return false;
   return true;
 }
 
@@ -783,8 +786,10 @@ function parsePeopleTotal(text) {
   if (nums.length) {
     const time = parseTime(text);
     if (time) {
-      const hour = Number(time.split(":")[0]);
-      const filtered = nums.filter((n) => n != hour);
+      const [hourStr, minStr] = time.split(":");
+      const hour = Number(hourStr);
+      const min = Number(minStr);
+      const filtered = nums.filter((n) => n !== hour && n !== min);
       if (filtered.length) return filtered[filtered.length - 1];
     }
     return nums[nums.length - 1];
@@ -875,6 +880,8 @@ function parsePeopleFromCardName(name) {
 }
 
 let TRELLO_LABEL_CACHE = null; // { byName: Map(name->id) }
+let TRELLO_LABEL_CACHE_AT = 0;
+const TRELLO_LABEL_CACHE_TTL = 60 * 60 * 1000; // 1 hora
 
 async function trelloGetBoardLabels(boardId) {
   const labels = await trelloGet(`https://api.trello.com/1/boards/${boardId}/labels?limit=1000&fields=name,color`);
@@ -884,7 +891,10 @@ async function trelloGetBoardLabels(boardId) {
 }
 
 async function trelloEnsureLabel(boardId, name, color) {
-  if (!TRELLO_LABEL_CACHE) TRELLO_LABEL_CACHE = await trelloGetBoardLabels(boardId);
+  if (!TRELLO_LABEL_CACHE || Date.now() - TRELLO_LABEL_CACHE_AT > TRELLO_LABEL_CACHE_TTL) {
+    TRELLO_LABEL_CACHE = await trelloGetBoardLabels(boardId);
+    TRELLO_LABEL_CACHE_AT = Date.now();
+  }
   const hit = TRELLO_LABEL_CACHE.byName.get(name);
   if (hit) return hit;
 
@@ -1098,9 +1108,6 @@ async function handleWebhook(bodyJson) {
   if (shouldThrottle(existing)) return;
 
   await ensureKnowledgeFresh();
-
-  // Templates cache
-  await ensureTemplatesFresh();
 
   // FIX domingo “abre hoje?”
   if (looksLikeOpenTodayQuestion(incomingText)) {
