@@ -178,6 +178,17 @@ function weekdaySaoPauloShort() {
 function isSundaySaoPaulo() {
   return weekdaySaoPauloShort() === "sun";
 }
+function todayInfoSaoPaulo() {
+  const now = new Date();
+  const fmtDate = new Intl.DateTimeFormat("pt-BR", {
+    timeZone: "America/Sao_Paulo",
+    weekday: "long",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+  });
+  return fmtDate.format(now); // ex: "quarta-feira, 25/03/2026"
+}
 function looksLikeOpenTodayQuestion(text) {
   const t = normalizeText(text);
   if (t.includes("abre hoje") || t.includes("abrem hoje") || t.includes("funciona hoje")) return true;
@@ -586,6 +597,7 @@ function sanitizeAnswer(text, question) {
 async function openaiAnswer({ question, retrieved }) {
   const sys = `
 Você é a Liz, assistente do restaurante Tsunagari (WhatsApp).
+Hoje é ${todayInfoSaoPaulo()} (horário de Brasília). Use essa informação para responder corretamente sobre promoções, horários ou eventos do dia.
 Tom:
 - Carinhoso e acolhedor.
 - Use 1 a 2 emojis leves quando combinar (🍣✨🙏😊❤️🍷). Não exagerar.
