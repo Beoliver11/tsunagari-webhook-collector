@@ -101,7 +101,7 @@ function looksLikeReservaIntent(text) {
     t.includes("reserva") ||
     t.includes("reservar") ||
     t.includes("quero reservar") ||
-    t.includes("mesa") ||
+    /\bmesa\b/.test(t) ||
     t.includes("agendar") ||
     t.includes("marcar")
   );
@@ -654,26 +654,77 @@ function asksNonJapaneseFood(text) {
 }
 
 // ===== Reserva parsing / validation =====
+const MONTH_NAMES_PT = {
+  janeiro: 1, jan: 1,
+  fevereiro: 2, fev: 2,
+  marco: 3, março: 3, mar: 3,
+  abril: 4, abr: 4,
+  maio: 5, mai: 5,
+  junho: 6, jun: 6,
+  julho: 7, jul: 7,
+  agosto: 8, ago: 8,
+  setembro: 9, set: 9,
+  outubro: 10, out: 10,
+  novembro: 11, nov: 11,
+  dezembro: 12, dez: 12,
+};
+
+// Tenta extrair { dd, mm, yyyy } de texto em linguagem natural (ex: "11 de abril", "abril 11")
+function parseDateByMonthName(text) {
+  const t = normalizeText(text);
+  const monthPattern = Object.keys(MONTH_NAMES_PT).join("|");
+  // "11 de abril [de 2026]" ou "11 abril"
+  const re1 = new RegExp(`\\b([0-3]?\\d)\\s+(?:de\\s+)?(${monthPattern})(?:\\s+(?:de\\s+)?(\\d{4}))?\\b`);
+  // "abril 11 [de 2026]" ou "abril, 11"
+  const re2 = new RegExp(`\\b(${monthPattern})[,\\s]+([0-3]?\\d)(?:\\s+(?:de\\s+)?(\\d{4}))?\\b`);
+  let m = t.match(re1);
+  if (m) {
+    const dd = Number(m[1]);
+    const mm = MONTH_NAMES_PT[m[2]];
+    const yyyy = m[3] ? Number(m[3]) : new Date().getFullYear();
+    if (dd >= 1 && dd <= 31 && mm) return { dd, mm, yyyy };
+  }
+  m = t.match(re2);
+  if (m) {
+    const mm = MONTH_NAMES_PT[m[1]];
+    const dd = Number(m[2]);
+    const yyyy = m[3] ? Number(m[3]) : new Date().getFullYear();
+    if (dd >= 1 && dd <= 31 && mm) return { dd, mm, yyyy };
+  }
+  return null;
+}
+
 function parseDateToListName(text) {
   const m = text.match(/\b([0-3]?\d)\/([01]?\d)(?:\/(\d{2}|\d{4}))?\b/);
-  if (!m) return null;
-  let dd = m[1].padStart(2, "0");
-  let mm = m[2].padStart(2, "0");
-  let yy = m[3];
-  if (!yy) yy = String(new Date().getFullYear()).slice(-2);
-  else if (yy.length === 4) yy = yy.slice(-2);
-  return `${dd}/${mm}/${yy}`;
+  if (m) {
+    let dd = m[1].padStart(2, "0");
+    let mm = m[2].padStart(2, "0");
+    let yy = m[3];
+    if (!yy) yy = String(new Date().getFullYear()).slice(-2);
+    else if (yy.length === 4) yy = yy.slice(-2);
+    return `${dd}/${mm}/${yy}`;
+  }
+  const byName = parseDateByMonthName(text);
+  if (byName) {
+    const dd = String(byName.dd).padStart(2, "0");
+    const mm = String(byName.mm).padStart(2, "0");
+    const yy = String(byName.yyyy).slice(-2);
+    return `${dd}/${mm}/${yy}`;
+  }
+  return null;
 }
 
 function parseDateBR(text) {
   const m = text.match(/\b([0-3]?\d)\/([01]?\d)(?:\/(\d{2}|\d{4}))?\b/);
-  if (!m) return null;
-  const dd = Number(m[1]);
-  const mm = Number(m[2]);
-  const yyyy = m[3]
-    ? Number(m[3].length === 2 ? "20" + m[3] : m[3])
-    : new Date().getFullYear();
-  return { dd, mm, yyyy };
+  if (m) {
+    const dd = Number(m[1]);
+    const mm = Number(m[2]);
+    const yyyy = m[3]
+      ? Number(m[3].length === 2 ? "20" + m[3] : m[3])
+      : new Date().getFullYear();
+    return { dd, mm, yyyy };
+  }
+  return parseDateByMonthName(text);
 }
 
 function dateBRToUTCDate({ dd, mm, yyyy }) {
