@@ -1,10 +1,10 @@
 /**
- * Tsunagari WhatsApp Bot (Evolution + Notion + Trello + OpenAI) — “produção”
+ * Tsunagari WhatsApp Bot (Evolution + Notion + Trello + OpenAI) — "produção"
  *
  * Ajustes (mar/2026):
  * - Notion reorganizado: FAQ / Templates / Regras / Links
  * - Pessoas na reserva: salvar APENAS total (inclui adultos+crianças+adolescentes+bebê)
- * - Mantém FIX domingo / “abre hoje?” determinístico (America/Sao_Paulo)
+ * - Mantém FIX domingo / "abre hoje?" determinístico (America/Sao_Paulo)
  * - Mantém: FAQ sem poluição de reservas (não usa DB de templates no knowledge)
  * - Mantém: Reserva parcial (hora sem data => assume HOJE SP)
  * - Mantém: Greeting não dispara dentro do fluxo de reserva
@@ -128,7 +128,7 @@ function looksLikeOptOut(text) {
 }
 
 function looksLikeGreeting(text) {
-  // Saudação “pura”, curta, e sem intenção junto
+  // Saudação "pura", curta, e sem intenção junto
   const t = normalizeText(text);
   if (t.includes("?")) return false;
   if (looksLikeReservaIntent(t)) return false;
@@ -167,7 +167,7 @@ function getIncomingMessageId(bodyJson) {
   return bodyJson?.data?.key?.id || bodyJson?.data?.messageId || bodyJson?.data?.id || "";
 }
 
-// ===== FIX domingo: “abre hoje?” determinístico (timezone SP) =====
+// ===== FIX domingo: "abre hoje?" determinístico (timezone SP) =====
 function weekdaySaoPauloShort() {
   const fmt = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/Sao_Paulo",
@@ -1086,7 +1086,7 @@ async function buildConfirmMessageFromNotionOrFallback({ nome, dataList, hora, p
   );
 }
 
-// ===== Anti-spam do “missing” =====
+// ===== Anti-spam do "missing" =====
 function missingSignature(missingArr) {
   return (missingArr || []).join("|");
 }
@@ -1173,7 +1173,7 @@ async function handleWebhook(bodyJson) {
 
   await ensureKnowledgeFresh();
 
-  // FIX domingo “abre hoje?”
+  // FIX domingo "abre hoje?"
   if (looksLikeOpenTodayQuestion(incomingText)) {
     if (FECHADO_DOMINGO !== "0" && isSundaySaoPaulo()) {
       await evolutionSendText({
@@ -1243,13 +1243,13 @@ async function handleWebhook(bodyJson) {
     if (inReservaFlow) clearConv(state, remoteJid);
     await evolutionSendText({
       remoteJid,
-      text: “As reservas são opcionais 😊 Você pode vir sem reserva, por ordem de chegada!\n\nMas se quiser garantir seu lugar, as reservas são feitas pelo nosso site 🍣\nAcesse: tsunagari-site.vercel.app”,
+      text: "As reservas são opcionais 😊 Você pode vir sem reserva, por ordem de chegada!\n\nMas se quiser garantir seu lugar, as reservas são feitas pelo nosso site 🍣\nAcesse: tsunagari-site.vercel.app",
     });
     markBotReplied(state, remoteJid);
     return;
 
     /* RESERVA WHATSAPP — desativado em 21/05/2026 (substituído pelo site)
-    const conv = existing && inReservaFlow ? existing : { mode: “reserva”, data: {}, startedAt: Date.now() };
+    const conv = existing && inReservaFlow ? existing : { mode: "reserva", data: {}, startedAt: Date.now() };
 
     // Se está esperando confirmação do limite e cliente insiste em horário impossível => handoff
     if (conv?.awaitingHoraMaxConfirm && !isAffirmative(incomingText)) {
@@ -1296,7 +1296,7 @@ async function handleWebhook(bodyJson) {
       conv.data.dataList = dateObjToDataList(todayObj);
     }
 
-    // nome “solto” dentro do fluxo de reserva
+    // nome "solto" dentro do fluxo de reserva
     if (!conv.data.nome && looksLikeStandaloneName(incomingText)) {
       conv.data.nome = incomingText.trim();
     }
@@ -1307,10 +1307,10 @@ async function handleWebhook(bodyJson) {
 
     // date validations
     if (conv.data.dateObj) {
-      if (FECHADO_DOMINGO !== “0” && isSundayBR(conv.data.dateObj)) {
+      if (FECHADO_DOMINGO !== "0" && isSundayBR(conv.data.dateObj)) {
         await evolutionSendText({
           remoteJid,
-          text: “A gente não abre aos domingos 🙂 Quer reservar pra outro dia? Funcionamos de segunda a sábado, 18:30 às 23h. 🍣”,
+          text: "A gente não abre aos domingos 🙂 Quer reservar pra outro dia? Funcionamos de segunda a sábado, 18:30 às 23h. 🍣",
         });
         clearConv(state, remoteJid);
         markBotReplied(state, remoteJid);
@@ -1319,7 +1319,7 @@ async function handleWebhook(bodyJson) {
       if (isPastDateBR(conv.data.dateObj)) {
         await evolutionSendText({
           remoteJid,
-          text: “Essa data já passou 🙂 Consegue me confirmar a data da reserva (DD/MM)?”,
+          text: "Essa data já passou 🙂 Consegue me confirmar a data da reserva (DD/MM)?",
         });
         markBotReplied(state, remoteJid);
         return;
@@ -1338,23 +1338,23 @@ async function handleWebhook(bodyJson) {
 
     // missing
     const missing = [];
-    if (!conv.data.nome) missing.push(“Nome”);
-    if (!conv.data.dataList) missing.push(“Data (DD/MM ou DD/MM/AAAA)”);
-    if (!conv.data.hora) missing.push(“Horário (ex.: 19:30)”);
-    if (conv.data.pessoasTotal == null) missing.push(“N° de pessoas (ex.: 4 adultos, 2 adolescentes e 2 crianças)”);
+    if (!conv.data.nome) missing.push("Nome");
+    if (!conv.data.dataList) missing.push("Data (DD/MM ou DD/MM/AAAA)");
+    if (!conv.data.hora) missing.push("Horário (ex.: 19:30)");
+    if (conv.data.pessoasTotal == null) missing.push("N° de pessoas (ex.: 4 adultos, 2 adolescentes e 2 crianças)");
 
     if (missing.length) {
       if (shouldSuppressMissingRepeat(conv, missing)) return;
 
       const pedir = await getTemplate(
-        “RESERVA_PEDIR_DADOS”,
-        “Para fazer sua reserva, me manda por favor:\n- Nome completo\n- Data (DD/MM)\n- Horário\n- N° de pessoas”
+        "RESERVA_PEDIR_DADOS",
+        "Para fazer sua reserva, me manda por favor:\n- Nome completo\n- Data (DD/MM)\n- Horário\n- N° de pessoas"
       );
 
       if (inReservaFlow) {
         await evolutionSendText({
           remoteJid,
-          text: `Para completar sua reserva só me confirma rapidinho 😊\n${missing.map((m) => `- ${m}`).join(“\n”)}`,
+          text: `Para completar sua reserva só me confirma rapidinho 😊\n${missing.map((m) => `- ${m}`).join("\n")}`,
         });
       } else {
         await evolutionSendText({ remoteJid, text: pedir });
@@ -1368,7 +1368,7 @@ async function handleWebhook(bodyJson) {
     // hour limit
     if (!isTimeAllowed(conv.data.hora)) {
       const msg = await getTemplate(
-        “RESERVA_SUGERIR_HORARIO_LIMITE”,
+        "RESERVA_SUGERIR_HORARIO_LIMITE",
         `Posso colocar ${RESERVA_HORA_MAX}? É o limite de horário para reserva. 😊`
       );
       conv.awaitingHoraMaxConfirm = true;
@@ -1400,7 +1400,7 @@ async function handleWebhook(bodyJson) {
       await handoffToHuman({
         state,
         remoteJid,
-        reason: “cliente pediu sofazinho/sofá — alocação manual necessária”,
+        reason: "cliente pediu sofazinho/sofá — alocação manual necessária",
         incomingText,
       });
       return;
@@ -1418,8 +1418,8 @@ async function handleWebhook(bodyJson) {
         return;
       }
       const msg = await getTemplate(
-        “RESERVA_SEM_VAGAS”,
-        “❗ Já atingimos o limite de reservas para esse dia. Você pode vir sem reserva, por ordem de chegada. 😊”
+        "RESERVA_SEM_VAGAS",
+        "❗ Já atingimos o limite de reservas para esse dia. Você pode vir sem reserva, por ordem de chegada. 😊"
       );
       await evolutionSendText({ remoteJid, text: msg });
       clearConv(state, remoteJid);
@@ -1431,7 +1431,7 @@ async function handleWebhook(bodyJson) {
     if (n === 2 && counts.twoP >= Number(RESERVA_MAX_2P_DIA)) {
       await evolutionSendText({
         remoteJid,
-        text: “Hoje já atingimos o limite de reservas para 2 pessoas. 😊 Mas você pode vir sem reserva por ordem de chegada. 🍣✨”,
+        text: "Hoje já atingimos o limite de reservas para 2 pessoas. 😊 Mas você pode vir sem reserva por ordem de chegada. 🍣✨",
       });
       clearConv(state, remoteJid);
       markBotReplied(state, remoteJid);
@@ -1451,8 +1451,8 @@ async function handleWebhook(bodyJson) {
         return;
       }
       const msg = await getTemplate(
-        “RESERVA_SEM_VAGAS”,
-        “❗ Já atingimos o limite de reservas para esse dia. Você pode vir sem reserva, por ordem de chegada. 😊”
+        "RESERVA_SEM_VAGAS",
+        "❗ Já atingimos o limite de reservas para esse dia. Você pode vir sem reserva, por ordem de chegada. 😊"
       );
       await evolutionSendText({ remoteJid, text: msg });
       clearConv(state, remoteJid);
@@ -1461,7 +1461,7 @@ async function handleWebhook(bodyJson) {
     }
 
     // Create card
-    const telefone = remoteJid.split(“@”)[0];
+    const telefone = remoteJid.split("@")[0];
     await trelloCreateReservaCard({
       listId: list.id,
       boardId: TRELLO_BOARD_ID,
