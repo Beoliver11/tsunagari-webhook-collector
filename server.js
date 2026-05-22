@@ -1598,6 +1598,14 @@ const server = http.createServer((req, res) => {
   } catch (e) {
     console.error(`[${nowIso()}] initial_load_failed`, e?.message || e);
   }
+
+  try {
+    await trelloEnsureList(TRELLO_BOARD_ID, "Atendimentos");
+    console.log(`[${nowIso()}] Trello lista "Atendimentos" pronta`);
+  } catch (e) {
+    console.error(`[${nowIso()}] trello_boot_failed`, e?.message || e);
+  }
+
   const PORT = Number(process.env.PORT || 3000);
   server.listen(PORT, () => console.log(`[${nowIso()}] Tsunagari bot on :${PORT}`));
 })();
