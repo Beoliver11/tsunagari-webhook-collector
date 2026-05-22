@@ -210,6 +210,18 @@ function looksLikeInsistence(text) {
   return /\b(insisto|tem como|não tem como|nao tem como|por favor|mas eu|mas preciso|eu preciso)\b/.test(t);
 }
 
+function looksLikeDiaDoNamorados(text) {
+  const t = normalizeText(text);
+  return (
+    t.includes("namorados") ||
+    t.includes("namorado") ||
+    t.includes("12 de junho") ||
+    /\b12\/06\b/.test(t) ||
+    (t.includes("dia 12") && t.includes("junho")) ||
+    (t.includes("dia 12") && t.includes("namorad"))
+  );
+}
+
 // ======== Persistent state (file) ========
 const STATE_PATH = process.env.STATE_PATH || path.join(__dirname, "state.json");
 function loadState() {
@@ -501,25 +513,46 @@ async function notifyHumans(text) {
 async function handoffToHuman({ state, remoteJid, reason, incomingText }) {
   const from = remoteJid.split("@")[0];
 
-  await evolutionSendText({
-    remoteJid,
-    text: "Entendi. Só um instante que vou chamar um atendente pra te ajudar direitinho por aqui. 🙏",
-  });
+  // 1. Mensagem pro cliente (template Notion ou fallback)
+  const clientMsg = await getTemplate(
+    "HANDOFF_CLIENTE",
+    "Entendi. Só um instante que vou chamar um atendente pra te ajudar direitinho por aqui. 🙏"
+  ).catch(() => "Entendi. Só um instante que vou chamar um atendente pra te ajudar direitinho por aqui. 🙏");
+  await evolutionSendText({ remoteJid, text: clientMsg });
 
-  const alert = `🙋 ATENDIMENTO HUMANO Motivo: ${reason} Cliente: ${from} Mensagem: ${incomingText}`;
+  // 2. Alert formatado para o atendente
+  const alert = [
+    "🙋 *ATENDIMENTO HUMANO*",
+    `Motivo: ${reason}`,
+    `Cliente: https://wa.me/${from}`,
+    `Mensagem: "${incomingText}"`,
+  ].join("\n");
+
+  // 3. Notifica humanos; admin só se não estiver já em HUMAN_NUMBERS (evita duplicata)
+  const humanNums = new Set(parseHumanNumbers());
   try {
     await notifyHumans(alert);
-    await notifyAdmin(alert);
+    if (ADMIN_WHATSAPP && !humanNums.has(ADMIN_WHATSAPP)) {
+      await notifyAdmin(alert);
+    }
   } catch (e) {
     console.error(`[${nowIso()}] handoff_notify_failed`, e?.message || e);
   }
 
-  // pausa conversa
+  // 4. Card no Trello (lista "Atendimentos")
+  if (TRELLO_KEY && TRELLO_TOKEN && TRELLO_BOARD_ID) {
+    try {
+      await trelloCreateHandoffCard({ boardId: TRELLO_BOARD_ID, from, reason, incomingText });
+    } catch (e) {
+      console.error(`[${nowIso()}] handoff_trello_failed`, e?.message || e);
+    }
+  }
+
+  // 5. Pausa a conversa
   const mins = Math.max(5, Number(HANDOFF_MINUTES || 180));
   const c = { mode: null, data: {} };
   setConv(state, remoteJid, c);
   setHandoffPause(state, remoteJid, mins);
-
   markBotReplied(state, remoteJid);
 }
 
@@ -1029,6 +1062,18 @@ function pickMesaType({ pessoasTotal, counts }) {
   return null; // 1 pessoa ou 12+ sai do fluxo convencional
 }
 
+async function trelloCreateHandoffCard({ boardId, from, reason, incomingText }) {
+  const list = await trelloEnsureList(boardId, "Atendimentos");
+  const title = `${from} — ${reason.slice(0, 80)}`;
+  const desc = [
+    `Telefone: ${from}`,
+    `Link: https://wa.me/${from}`,
+    `Motivo: ${reason}`,
+    `Mensagem: ${incomingText}`,
+  ].join("\n");
+  return await trelloPost(`https://api.trello.com/1/cards?idList=${list.id}`, { name: title, desc });
+}
+
 async function trelloCreateReservaCard({ listId, boardId, mesaType, nome, hora, pessoasTotal, telefone }) {
   const pessoasLabel = `${Number(pessoasTotal)}p`;
   const title = `${nome} - ${hora} - ${pessoasLabel}`;
@@ -1168,6 +1213,17 @@ async function handleWebhook(bodyJson) {
     return;
   }
 
+  // Dia dos Namorados (12/06) — sistema especial de reservas, handoff imediato (FURA throttle)
+  if (looksLikeDiaDoNamorados(incomingText)) {
+    await handoffToHuman({
+      state,
+      remoteJid,
+      reason: "Dia dos Namorados (12/06) — sistema especial de reservas",
+      incomingText,
+    });
+    return;
+  }
+
   // throttle
   if (shouldThrottle(existing)) return;
 
@@ -1226,15 +1282,14 @@ async function handleWebhook(bodyJson) {
     return;
   }
 
-  // Order intent => notify admin (só fora de reserva)
+  // Order intent => handoff completo (pausa o bot + card Trello + alerta)
   if (!inReservaFlow && looksLikeOrderIntent(incomingText)) {
-    const from = remoteJid.split("@")[0];
-    await notifyAdmin(`⚠️ POSSÍVEL PEDIDO (precisa de atendimento humano) Cliente: ${from} Mensagem: ${incomingText}`);
-    await evolutionSendText({
+    await handoffToHuman({
+      state,
       remoteJid,
-      text: "Entendi! 😊 Só um instante que vou chamar alguém da equipe pra te ajudar por aqui. 🍣",
+      reason: "possível pedido/delivery — requer atendimento humano",
+      incomingText,
     });
-    markBotReplied(state, remoteJid);
     return;
   }
 
