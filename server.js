@@ -167,6 +167,16 @@ function getIncomingMessageId(bodyJson) {
   return bodyJson?.data?.key?.id || bodyJson?.data?.messageId || bodyJson?.data?.id || "";
 }
 
+function extractIncomingMediaType(bodyJson) {
+  const msg = bodyJson?.data?.message || {};
+  if (msg.audioMessage || msg.pttMessage) return "audio";
+  if (msg.stickerMessage) return "sticker";
+  if (msg.documentMessage) return "document";
+  if (msg.imageMessage && !msg.imageMessage.caption) return "image";
+  if (msg.videoMessage && !msg.videoMessage.caption) return "video";
+  return null;
+}
+
 // ===== FIX domingo: "abre hoje?" determinístico (timezone SP) =====
 function weekdaySaoPauloShort() {
   const fmt = new Intl.DateTimeFormat("en-US", {
@@ -475,6 +485,24 @@ async function evolutionSendText({ remoteJid, text }) {
   return body;
 }
 
+async function evolutionSendTyping({ remoteJid, durationMs = 1500 }) {
+  const number = (remoteJid || "").split("@")[0];
+  const url =
+    EVOLUTION_SERVER_URL.replace(/\/$/, "") +
+    "/chat/sendPresence/" +
+    encodeURIComponent(EVOLUTION_INSTANCE);
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: EVOLUTION_APIKEY },
+      body: JSON.stringify({ number, presence: "composing", delay: durationMs }),
+    });
+    await new Promise((r) => setTimeout(r, Math.min(durationMs, 2500)));
+  } catch {
+    // typing indicator é best-effort; ignora erros
+  }
+}
+
 async function notifyAdmin(text) {
   if (!ADMIN_WHATSAPP) return;
   try {
@@ -627,7 +655,7 @@ function sanitizeAnswer(text, question) {
 }
 
 // ===== OpenAI =====
-async function openaiAnswer({ question, retrieved }) {
+async function openaiAnswer({ question, retrieved, history = [] }) {
   const sys = `
 Você é a Liz, assistente do restaurante Tsunagari (WhatsApp).
 Hoje é ${todayInfoSaoPaulo()} (horário de Brasília). Use essa informação para responder corretamente sobre promoções, horários ou eventos do dia.
@@ -660,6 +688,7 @@ Formato:
       model: OPENAI_MODEL,
       input: [
         { role: "system", content: sys },
+        ...history.map((h) => ({ role: h.role, content: h.content })),
         { role: "user", content: user },
       ],
       temperature: 0.25,
@@ -1168,13 +1197,19 @@ async function handleWebhook(bodyJson) {
   if (bodyJson?.data?.key?.fromMe) {
     const state = loadState();
     const mins = Math.max(5, Number(HANDOFF_MINUTES || 180));
+    const existingConv = getConv(state, remoteJid);
+    if (existingConv) {
+      existingConv.humanRepliedAt = Date.now(); // cancela o lembrete de 10min
+      setConv(state, remoteJid, existingConv);
+    }
     setHandoffPause(state, remoteJid, mins);
     console.log(`[${nowIso()}] handoff pause set jid=${remoteJid} mins=${mins}`);
     return;
   }
 
   const incomingText = extractIncomingText(bodyJson);
-  if (!incomingText) return;
+  const mediaType = !incomingText ? extractIncomingMediaType(bodyJson) : null;
+  if (!incomingText && !mediaType) return;
 
   const state = loadState();
 
@@ -1228,6 +1263,18 @@ async function handleWebhook(bodyJson) {
   if (shouldThrottle(existing)) return;
 
   await ensureKnowledgeFresh();
+
+  // Mídia sem texto (foto, áudio, sticker, documento sem legenda)
+  if (mediaType && !incomingText) {
+    const mediaMsg = await getTemplate(
+      "MEDIA_SEM_TEXTO",
+      "Recebi! Me escreve o que precisa que te ajudo 😊"
+    );
+    await evolutionSendTyping({ remoteJid, durationMs: 800 });
+    await evolutionSendText({ remoteJid, text: mediaMsg });
+    markBotReplied(state, remoteJid);
+    return;
+  }
 
   // FIX domingo "abre hoje?"
   if (looksLikeOpenTodayQuestion(incomingText)) {
@@ -1545,21 +1592,67 @@ async function handleWebhook(bodyJson) {
 
   // ===== FAQ (Notion + OpenAI) =====
   const retrieved = simpleRetrieve(incomingText, KNOWLEDGE, 12);
-  const answer = await openaiAnswer({ question: incomingText, retrieved });
+
+  // Contexto: últimas 3 trocas da conversa
+  const faqConv = getConv(state, remoteJid) || { mode: null, data: {} };
+  const history = (faqConv.history || []).slice(-6);
+
+  // Typing enquanto OpenAI processa
+  const typingMs = Math.min(3000, 800 + incomingText.length * 20);
+  await evolutionSendTyping({ remoteJid, durationMs: typingMs });
+
+  let answer;
+  try {
+    answer = await openaiAnswer({ question: incomingText, retrieved, history });
+  } catch (e) {
+    console.error(`[${nowIso()}] openai_failed`, e?.message || e);
+    answer = await getTemplate(
+      "OPENAI_FALLBACK",
+      "Tive uma dificuldade aqui! Me manda sua pergunta novamente ou aguarda um instante. 🙏"
+    ).catch(() => "Tive uma dificuldade aqui! Me manda sua pergunta novamente ou aguarda um instante. 🙏");
+  }
+
   await evolutionSendText({ remoteJid, text: answer });
+
+  // Salva histórico (máx. 4 pares = 8 mensagens)
+  faqConv.history = [
+    ...history,
+    { role: "user", content: incomingText },
+    { role: "assistant", content: answer },
+  ].slice(-8);
+  setConv(state, remoteJid, faqConv);
   markBotReplied(state, remoteJid);
 }
 
 // ===== HTTP server =====
 const server = http.createServer((req, res) => {
   if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
-    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-    return res.end("OK");
+    const payload = JSON.stringify({
+      status: "ok",
+      uptime_s: Math.floor(process.uptime()),
+      knowledge_rows: KNOWLEDGE.length,
+      templates: TEMPLATE_CACHE.size,
+      knowledge_loaded_at: lastLoadAt ? new Date(lastLoadAt).toISOString() : null,
+    });
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    return res.end(payload);
   }
 
   let buf = [];
   req.on("data", (c) => buf.push(c));
   req.on("end", async () => {
+    // Validação de origem: se WEBHOOK_SECRET estiver configurado, exige o header
+    const secret = process.env.WEBHOOK_SECRET;
+    if (secret) {
+      const incoming =
+        req.headers["x-webhook-secret"] ||
+        (req.headers["authorization"] || "").replace(/^Bearer\s+/i, "");
+      if (incoming !== secret) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        return res.end("Unauthorized");
+      }
+    }
+
     // ACK rápido pro webhook
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     res.end("OK");
@@ -1605,6 +1698,46 @@ const server = http.createServer((req, res) => {
   } catch (e) {
     console.error(`[${nowIso()}] trello_boot_failed`, e?.message || e);
   }
+
+  // Lembrete de handoff: reenviar alerta se nenhum humano respondeu em 10 minutos
+  const HANDOFF_REMINDER_MS = 10 * 60 * 1000;
+  setInterval(async () => {
+    try {
+      const st = loadState();
+      const now = Date.now();
+      const humanNums = new Set(parseHumanNumbers());
+
+      for (const [jid, conv] of Object.entries(st.conversations || {})) {
+        if (!conv.handoffAt) continue;
+        if (conv.humanRepliedAt) continue;        // humano já respondeu
+        if (conv.handoffReminderSentAt) continue; // lembrete já enviado
+        if (now - conv.handoffAt < HANDOFF_REMINDER_MS) continue;
+
+        const from = jid.split("@")[0];
+        const since = new Date(conv.handoffAt).toLocaleTimeString("pt-BR", {
+          timeZone: "America/Sao_Paulo",
+        });
+        const reminder = [
+          "⏰ *SEM RESPOSTA HÁ 10 MINUTOS*",
+          `Cliente aguardando: https://wa.me/${from}`,
+          `Handoff às: ${since}`,
+        ].join("\n");
+
+        for (const num of humanNums) {
+          await evolutionSendText({ remoteJid: `${num}@s.whatsapp.net`, text: reminder }).catch(() => {});
+        }
+        if (ADMIN_WHATSAPP && !humanNums.has(ADMIN_WHATSAPP)) {
+          await evolutionSendText({ remoteJid: `${ADMIN_WHATSAPP}@s.whatsapp.net`, text: reminder }).catch(() => {});
+        }
+
+        conv.handoffReminderSentAt = now;
+        setConv(st, jid, conv);
+        console.log(`[${nowIso()}] handoff_reminder_sent jid=${jid}`);
+      }
+    } catch (e) {
+      console.error(`[${nowIso()}] handoff_reminder_check_failed`, e?.message || e);
+    }
+  }, 2 * 60 * 1000); // verifica a cada 2 minutos
 
   const PORT = Number(process.env.PORT || 3000);
   server.listen(PORT, () => console.log(`[${nowIso()}] Tsunagari bot on :${PORT}`));
