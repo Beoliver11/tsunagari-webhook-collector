@@ -100,10 +100,9 @@ function looksLikeReservaIntent(text) {
   return (
     t.includes("reserva") ||
     t.includes("reservar") ||
-    t.includes("quero reservar") ||
-    /\bmesa\b/.test(t) ||
     t.includes("agendar") ||
-    t.includes("marcar")
+    /\bmarcar\s+(mesa|reserva|lugar|horario)\b/.test(t) ||
+    /\b(quero|preciso|tem|ha)\s+(uma?\s+)?mesa\b/.test(t)
   );
 }
 function looksLikeSofaRequest(text) {
@@ -208,6 +207,20 @@ function looksLikeOpenTodayQuestion(text) {
   return hasHoje && hasOpenVerb;
 }
 
+function looksLikeSundayQuestion(text) {
+  const t = normalizeText(text);
+  const hasDomingo = /\b(domingo|domingos)\b/.test(t);
+  if (!hasDomingo) return false;
+  // qualquer intenção de ir, reservar ou perguntar horário no domingo
+  return /\b(abre|abrem|aberto|fecha|fechado|funciona|funcionam|atende|horario|hora|reserva|reservar|ir|vou|vamos|posso|pode|da para|daria|consegue|jantar|comer|visitar|aparecer)\b/.test(t);
+}
+
+function looksLikeComingTodayIntent(text) {
+  const t = normalizeText(text);
+  if (!/\bhoje\b/.test(t)) return false;
+  return /\b(ir|vou|vamos|posso|pode|da para|daria|consegue|reservar|reserva|jantar|comer|visitar|aparecer|passar|mesa)\b/.test(t);
+}
+
 // ===== Handoff inteligente =====
 function looksLikeSensitiveTopic(text) {
   const t = normalizeText(text);
@@ -218,6 +231,11 @@ function looksLikeSensitiveTopic(text) {
 function looksLikeInsistence(text) {
   const t = normalizeText(text);
   return /\b(insisto|tem como|não tem como|nao tem como|por favor|mas eu|mas preciso|eu preciso)\b/.test(t);
+}
+
+function looksLikeFrustration(text) {
+  // Cliente mandou só "?", "??", "???" ou "!" — sinal claro de confusão/frustração
+  return /^[?!]{1,6}$/.test((text || "").trim());
 }
 
 function looksLikeDiaDoNamorados(text) {
@@ -567,16 +585,7 @@ async function handoffToHuman({ state, remoteJid, reason, incomingText }) {
     console.error(`[${nowIso()}] handoff_notify_failed`, e?.message || e);
   }
 
-  // 4. Card no Trello (lista "Atendimentos")
-  if (TRELLO_KEY && TRELLO_TOKEN && TRELLO_BOARD_ID) {
-    try {
-      await trelloCreateHandoffCard({ boardId: TRELLO_BOARD_ID, from, reason, incomingText });
-    } catch (e) {
-      console.error(`[${nowIso()}] handoff_trello_failed`, e?.message || e);
-    }
-  }
-
-  // 5. Pausa a conversa
+  // 4. Pausa a conversa
   const mins = Math.max(5, Number(HANDOFF_MINUTES || 180));
   const c = { mode: null, data: {} };
   setConv(state, remoteJid, c);
@@ -656,9 +665,14 @@ function sanitizeAnswer(text, question) {
 
 // ===== OpenAI =====
 async function openaiAnswer({ question, retrieved, history = [] }) {
+  const sundayWarning =
+    FECHADO_DOMINGO !== "0" && isSundaySaoPaulo()
+      ? "\n⚠️ HOJE É DOMINGO — O RESTAURANTE ESTÁ FECHADO. Não abrimos aos domingos. Se alguém perguntar sobre horário, visita ou reserva hoje, informe que estamos fechados e que funcionamos de segunda a sábado, 18:30 às 23h."
+      : "";
+
   const sys = `
 Você é a Liz, assistente do restaurante Tsunagari (WhatsApp).
-Hoje é ${todayInfoSaoPaulo()} (horário de Brasília). Use essa informação para responder corretamente sobre promoções, horários ou eventos do dia.
+Hoje é ${todayInfoSaoPaulo()} (horário de Brasília). Use essa informação para responder corretamente sobre promoções, horários ou eventos do dia.${sundayWarning}
 Tom:
 - Carinhoso e acolhedor.
 - Use 1 a 2 emojis leves quando combinar (🍣✨🙏😊❤️🍷). Não exagerar.
@@ -1237,6 +1251,17 @@ async function handleWebhook(bodyJson) {
     return;
   }
 
+  // Frustração / confusão ("?", "??") => handoff imediato
+  if (looksLikeFrustration(incomingText)) {
+    await handoffToHuman({
+      state,
+      remoteJid,
+      reason: "cliente confuso ou frustrado (enviou apenas '?'/'!')",
+      incomingText,
+    });
+    return;
+  }
+
   // Assunto delicado => handoff (FURA throttle)
   if (looksLikeSensitiveTopic(incomingText)) {
     await handoffToHuman({
@@ -1259,6 +1284,23 @@ async function handleWebhook(bodyJson) {
     return;
   }
 
+  // ===== Guard de domingo — fura throttle (igual ao assunto delicado) =====
+  if (FECHADO_DOMINGO !== "0" && isSundaySaoPaulo()) {
+    const isDomingoQuestion =
+      looksLikeOpenTodayQuestion(incomingText) ||
+      looksLikeSundayQuestion(incomingText) ||
+      looksLikeComingTodayIntent(incomingText) ||
+      looksLikeReservaIntent(incomingText);   // reserva em qualquer forma
+    if (isDomingoQuestion) {
+      await evolutionSendText({
+        remoteJid,
+        text: "Hoje é domingo e a gente não abre 🙁\nFuncionamos de segunda a sábado, das 18:30 às 23h. Te esperamos na semana! 🍣✨",
+      });
+      markBotReplied(state, remoteJid);
+      return;
+    }
+  }
+
   // throttle
   if (shouldThrottle(existing)) return;
 
@@ -1276,17 +1318,8 @@ async function handleWebhook(bodyJson) {
     return;
   }
 
-  // FIX domingo "abre hoje?"
+  // "Abre hoje?" — domingo já tratado pelo guard acima; aqui só dias normais
   if (looksLikeOpenTodayQuestion(incomingText)) {
-    if (FECHADO_DOMINGO !== "0" && isSundaySaoPaulo()) {
-      await evolutionSendText({
-        remoteJid,
-        text: "Hoje (domingo) a gente não abre 🙂 Funcionamos de segunda a sábado, 18:30 às 23h. 🍣✨",
-      });
-      markBotReplied(state, remoteJid);
-      return;
-    }
-
     await evolutionSendText({
       remoteJid,
       text: "Hoje a gente abre a partir das 18:30 e vai até 23h 🍣✨",
