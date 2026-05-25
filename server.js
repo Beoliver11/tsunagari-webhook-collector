@@ -95,6 +95,18 @@ function normalizeText(s) {
 }
 
 // ===== intents / parsing =====
+function looksLikeReservaDuvida(text) {
+  // Pessoa pergunta SE precisa reservar, não que QUER reservar
+  const t = normalizeText(text);
+  return (
+    /\b(precisa|preciso|preciso fazer|precisa fazer|tenho que|tem que|e obrigatorio|é obrigatorio|e necessario|é necessario|e preciso|é preciso)\b/.test(t) ||
+    /\b(posso|da|dá|consigo)\s+(ir|vir|aparecer|entrar)\s+sem\b/.test(t) ||
+    /\bsem\s+reserva\b/.test(t) ||
+    t.includes("opcional") ||
+    t.includes("obrigat")
+  );
+}
+
 function looksLikeReservaJaFeita(text) {
   const t = normalizeText(text);
   return (
@@ -1401,10 +1413,14 @@ async function handleWebhook(bodyJson) {
   // ===== Reserva — redireciona para o site =====
   if (looksLikeReservaIntent(incomingText) || looksLikeSofaRequest(incomingText) || inReservaFlow) {
     if (inReservaFlow) clearConv(state, remoteJid);
-    await evolutionSendText({
-      remoteJid,
-      text: "As reservas sao opcionais 😊 Voce pode vir sem reserva, por ordem de chegada!\n\nMas se quiser garantir seu lugar, as reservas sao feitas pelo nosso site 🍣\nAcesse: tsunagari-site.vercel.app",
-    });
+
+    const reservaText = looksLikeReservaDuvida(incomingText)
+      // Pessoa quer saber se é obrigatório → explica que é opcional
+      ? "As reservas sao opcionais 😊 Voce pode vir sem reserva, por ordem de chegada!\n\nMas se quiser garantir seu lugar, acesse nosso site 🍣\ntsuanagari-site.vercel.app"
+      // Pessoa quer reservar → so o link
+      : "Faca sua reserva pelo nosso site! 🍣\nAcesse: tsunagari-site.vercel.app";
+
+    await evolutionSendText({ remoteJid, text: reservaText });
     markBotReplied(state, remoteJid);
     return;
 
