@@ -96,12 +96,13 @@ function normalizeText(s) {
 
 // ===== intents / parsing =====
 function looksLikeReservaDuvida(text) {
-  // Pessoa pergunta SE precisa reservar, não que QUER reservar
+  // Pessoa PERGUNTA se precisa reservar — não afirma que quer reservar
   const t = normalizeText(text);
+  if (!t.includes("?") && !/\b(precisa|preciso|tenho que|tem que|obrigat|necessari|e preciso|é preciso|opcional)\b/.test(t)) return false;
   return (
-    /\b(precisa|preciso|preciso fazer|precisa fazer|tenho que|tem que|e obrigatorio|é obrigatorio|e necessario|é necessario|e preciso|é preciso)\b/.test(t) ||
-    /\b(posso|da|dá|consigo)\s+(ir|vir|aparecer|entrar)\s+sem\b/.test(t) ||
-    /\bsem\s+reserva\b/.test(t) ||
+    /\b(precisa|preciso|tenho que|tem que|e obrigatorio|e necessario|e preciso)\b/.test(t) ||
+    /\b(posso|da|da pra|consigo)\s+(ir|vir|aparecer|entrar)\s+sem\b/.test(t) ||
+    /\b(sem reserva|sem fazer reserva)\b/.test(t) && t.includes("?") ||
     t.includes("opcional") ||
     t.includes("obrigat")
   );
@@ -138,10 +139,13 @@ function looksLikeSofaRequest(text) {
 }
 function looksLikeOrderIntent(text) {
   const t = normalizeText(text);
-  // Evitar falso positivo em frases tipo "manda o cardápio"
   return (
-    /\b(pedido|pedir|quero pedir|vou querer|entrega|delivery|retirar|take away|para viagem)\b/.test(t) ||
-    /\b(ifood|i-food|ubereats|uber eats|rappi)\b/.test(t)
+    // delivery/apps — sempre order intent
+    /\b(delivery|ifood|i-food|ubereats|uber eats|rappi|entrega|take away|para viagem)\b/.test(t) ||
+    // "pedir" só com contexto de comida/pedido (evita "pedir informações", "pedir o cardápio")
+    /\b(fazer um pedido|quero pedir|vou pedir|vou querer|meu pedido|numero do pedido)\b/.test(t) ||
+    // retirar só em contexto de retirada de comida
+    /\b(retirar no local|retirar o pedido|buscar o pedido)\b/.test(t)
   );
 }
 function looksLikeOptOut(text) {
@@ -1317,7 +1321,8 @@ async function handleWebhook(bodyJson) {
       looksLikeOpenTodayQuestion(incomingText) ||
       looksLikeSundayQuestion(incomingText) ||
       looksLikeComingTodayIntent(incomingText) ||
-      looksLikeReservaIntent(incomingText);   // reserva em qualquer forma
+      // reserva só se for sobre HOJE (não bloqueia reservas futuras feitas num domingo)
+      (looksLikeReservaIntent(incomingText) && /\bhoje\b/.test(normalizeText(incomingText)));
     if (isDomingoQuestion) {
       await evolutionSendText({
         remoteJid,
@@ -1404,7 +1409,7 @@ async function handleWebhook(bodyJson) {
   if (looksLikeReservaJaFeita(incomingText)) {
     await evolutionSendText({
       remoteJid,
-      text: "Que otimo! Te esperamos 🍣✨ Qualquer duvida e so chamar!",
+      text: "Que ótimo! Te esperamos 🍣✨ Qualquer dúvida é só chamar!",
     });
     markBotReplied(state, remoteJid);
     return;
@@ -1416,9 +1421,9 @@ async function handleWebhook(bodyJson) {
 
     const reservaText = looksLikeReservaDuvida(incomingText)
       // Pessoa quer saber se é obrigatório → explica que é opcional
-      ? "As reservas sao opcionais 😊 Voce pode vir sem reserva, por ordem de chegada!\n\nMas se quiser garantir seu lugar, acesse nosso site 🍣\ntsuanagari-site.vercel.app"
-      // Pessoa quer reservar → so o link
-      : "Faca sua reserva pelo nosso site! 🍣\nAcesse: tsunagari-site.vercel.app";
+      ? "As reservas são opcionais 😊 Você pode vir sem reserva, por ordem de chegada!\n\nMas se quiser garantir seu lugar, acesse nosso site 🍣\ntsuangari-site.vercel.app"
+      // Pessoa quer reservar → só o link
+      : "Faça sua reserva pelo nosso site! 🍣\nAcesse: tsunagari-site.vercel.app";
 
     await evolutionSendText({ remoteJid, text: reservaText });
     markBotReplied(state, remoteJid);
