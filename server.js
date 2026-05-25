@@ -95,7 +95,20 @@ function normalizeText(s) {
 }
 
 // ===== intents / parsing =====
+function looksLikeReservaJaFeita(text) {
+  const t = normalizeText(text);
+  return (
+    /\b(ja|já)\s+(fiz|fiz a|reservei|confirmei)\b/.test(t) ||
+    /\b(fiz|fiz a|confirmei)\s+(minha|a|uma)?\s*reserva\b/.test(t) ||
+    t.includes("reserva confirmada") ||
+    t.includes("confirmei minha reserva") ||
+    t.includes("ja reservei") ||
+    t.includes("já reservei")
+  );
+}
+
 function looksLikeReservaIntent(text) {
+  if (looksLikeReservaJaFeita(text)) return false; // reserva já feita não é intent de reservar
   const t = normalizeText(text);
   return (
     t.includes("reserva") ||
@@ -680,8 +693,10 @@ Tom:
 - NÃO comece com saudação ("Olá", "Oi", "Oie").
 - NÃO finalize com despedidas.
 Conteúdo:
-- Responda o que o cliente perguntou. Se houver promoção diretamente relacionada ao assunto (ex: perguntou sobre rodízio e existe promoção de rodízio), mencione brevemente como complemento. Não liste promoções aleatórias nem off-topic.
+- Responda APENAS o que o cliente perguntou. Seja direto.
+- NÃO mencione promoções, descontos ou ofertas proativamente. Só fale de promoções se o cliente perguntar explicitamente sobre desconto ou promoção.
 - NÃO envie links a menos que o cliente peça link.
+- PREÇOS: NUNCA invente ou estime valores. Só mencione preços se estiverem literalmente nos trechos do Notion. Se não houver, diga que não tem essa informação no momento.
 - RESERVAS: reserva é OPCIONAL (o cliente pode vir sem reserva por ordem de chegada). Se o cliente perguntar se precisa reservar, como reservar, onde reservar ou qualquer coisa sobre reservas, diga que é opcional e que se quiser pode reservar pelo site tsunagari-site.vercel.app. Nunca instrua o cliente a enviar dados de reserva pelo WhatsApp.
 - Não invente informações; use apenas os trechos fornecidos.
 - Se faltou informação, faça uma pergunta curta e objetiva.
@@ -1373,12 +1388,22 @@ async function handleWebhook(bodyJson) {
     return;
   }
 
+  // Reserva já confirmada pelo cliente — só acknowledges
+  if (looksLikeReservaJaFeita(incomingText)) {
+    await evolutionSendText({
+      remoteJid,
+      text: "Que otimo! Te esperamos 🍣✨ Qualquer duvida e so chamar!",
+    });
+    markBotReplied(state, remoteJid);
+    return;
+  }
+
   // ===== Reserva — redireciona para o site =====
   if (looksLikeReservaIntent(incomingText) || looksLikeSofaRequest(incomingText) || inReservaFlow) {
     if (inReservaFlow) clearConv(state, remoteJid);
     await evolutionSendText({
       remoteJid,
-      text: "As reservas são opcionais 😊 Você pode vir sem reserva, por ordem de chegada!\n\nMas se quiser garantir seu lugar, as reservas são feitas pelo nosso site 🍣\nAcesse: tsunagari-site.vercel.app",
+      text: "As reservas sao opcionais 😊 Voce pode vir sem reserva, por ordem de chegada!\n\nMas se quiser garantir seu lugar, as reservas sao feitas pelo nosso site 🍣\nAcesse: tsunagari-site.vercel.app",
     });
     markBotReplied(state, remoteJid);
     return;
