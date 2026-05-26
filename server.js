@@ -42,6 +42,7 @@ const {
   // NOVO (recomendado): Notion DBs por função
   NOTION_DB_FAQ = "2bf12169-2df7-806a-82cc-d8c1c3e39202", // DB — FAQ (Respostas)
   NOTION_DB_TEMPLATES = "516f3fa8-2a01-473d-ab97-e77c51ab4ae7", // DB — Templates (Mensagens prontas)
+  NOTION_DB_BOT_RULES = "952dc44d73e841fdbda0b1dc4ae5bbd1", // DB — Regras do Bot v2 (motor dinâmico)
   NOTION_DB_CARDAPIO = "", // opcional
 
   // Antigo (compat): caso você ainda use os DBs antigos
@@ -140,14 +141,31 @@ function looksLikeSofaRequest(text) {
 function looksLikeOrderIntent(text) {
   const t = normalizeText(text);
   return (
-    // delivery/apps — sempre order intent
-    /\b(delivery|ifood|i-food|ubereats|uber eats|rappi|entrega|take away|para viagem)\b/.test(t) ||
-    // "pedir" só com contexto de comida/pedido (evita "pedir informações", "pedir o cardápio")
+    // apps de delivery com verbo de ação — quer fazer pedido pelo app
+    /\b(ifood|i-food|ubereats|uber eats|rappi)\b/.test(t) && !/\?/.test(t) ||
+    // intenção explícita de pedir/pedido (evita "pedir informações", "pedir o cardápio")
     /\b(fazer um pedido|quero pedir|vou pedir|vou querer|meu pedido|numero do pedido)\b/.test(t) ||
     // retirar só em contexto de retirada de comida
-    /\b(retirar no local|retirar o pedido|buscar o pedido)\b/.test(t)
+    /\b(retirar no local|retirar o pedido|buscar o pedido)\b/.test(t) ||
+    // delivery/entrega + verbo de ação explícito (não só "tem delivery?")
+    /\b(pedir|encomendar|fazer pedido)\b.{0,30}\b(delivery|entrega)\b/.test(t) ||
+    /\b(delivery|entrega)\b.{0,30}\b(quero|vou|posso pedir|fazer pedido)\b/.test(t)
   );
 }
+// ===== Gatilhos para o motor de regras =====
+function looksLikePromoIntent(text) {
+  const t = normalizeText(text);
+  return /\b(desconto|descontos|promocao|promocoes|oferta|ofertas|cupom|cupons|promo)\b/.test(t);
+}
+function looksLikeDeliveryIntent(text) {
+  const t = normalizeText(text);
+  return /\b(delivery|entrega|take away|para viagem|ifood|i-food|rappi|ubereats|uber eats)\b/.test(t);
+}
+function looksLikeHorarioIntent(text) {
+  const t = normalizeText(text);
+  return /\b(horario|hora|abre|abrem|fecha|fechado|funciona|funcionam|aberto|quando abre)\b/.test(t);
+}
+
 function looksLikeOptOut(text) {
   const t = normalizeText(text);
   return /\b(parar|pare|stop|cancelar mensagens|nao quero receber|não quero receber|remover meu numero|remover meu número|descadastrar|sair|cancelar notificacoes|cancelar notificações)\b/.test(
@@ -215,6 +233,16 @@ function weekdaySaoPauloShort() {
 }
 function isSundaySaoPaulo() {
   return weekdaySaoPauloShort() === "sun";
+}
+function todayStrSaoPaulo() {
+  // Retorna "YYYY-MM-DD" no fuso de SP — para comparar com datas do Notion
+  return new Intl.DateTimeFormat("sv-SE", { timeZone: "America/Sao_Paulo" }).format(new Date());
+}
+function currentWeekdaySP() {
+  // Retorna 'seg'|'ter'|'qua'|'qui'|'sex'|'sab'|'dom'
+  const map = { Sun: "dom", Mon: "seg", Tue: "ter", Wed: "qua", Thu: "qui", Fri: "sex", Sat: "sab" };
+  const short = new Intl.DateTimeFormat("en-US", { timeZone: "America/Sao_Paulo", weekday: "short" }).format(new Date());
+  return map[short] || "dom";
 }
 function todayInfoSaoPaulo() {
   const now = new Date();
@@ -513,6 +541,79 @@ async function ensureKnowledgeFresh() {
   await loadTemplates();
 }
 
+// ===== Motor de Regras (Notion) =====
+let BOT_RULES = [];
+let lastBotRulesLoadAt = 0;
+
+async function loadBotRules() {
+  if (!NOTION_DB_BOT_RULES) return;
+  try {
+    const r = await fetch(`https://api.notion.com/v1/databases/${NOTION_DB_BOT_RULES}/query`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${NOTION_TOKEN}`,
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ page_size: 100 }), // sem filtro de checkbox — regra vale pelo período/dias
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(`Notion rules failed ${r.status}: ${JSON.stringify(j)}`);
+
+    BOT_RULES = (j.results || [])
+      .map((p) => {
+        try {
+          const props = p.properties;
+          return {
+            titulo: (props["Regra"]?.title || []).map((t) => t.plain_text).join("") || "",
+            validoDe: props["Válido de"]?.date?.start || null,
+            validoAte: props["Válido até"]?.date?.start || null,
+            dias: (props["Dias da semana"]?.multi_select || []).map((d) => d.name),
+            gatilhos: (props["Gatilho"]?.multi_select || []).map((g) => g.name),
+            acao: props["Ação"]?.select?.name || "",
+            conteudo: (props["Conteúdo"]?.rich_text || []).map((t) => t.plain_text).join("") || "",
+            prioridade: props["Prioridade"]?.number ?? 99,
+          };
+        } catch (_) {
+          return null;
+        }
+      })
+      .filter(Boolean);
+
+    BOT_RULES.sort((a, b) => a.prioridade - b.prioridade);
+    lastBotRulesLoadAt = Date.now();
+    console.log(`[${nowIso()}] Bot rules loaded: ${BOT_RULES.length}`);
+  } catch (e) {
+    console.error(`[${nowIso()}] loadBotRules error: ${e.message}`);
+  }
+}
+
+async function ensureBotRulesFresh() {
+  const maxAgeMs = 5 * 60 * 1000; // 5 min cache
+  if (Date.now() - lastBotRulesLoadAt > maxAgeMs) await loadBotRules();
+}
+
+function getActiveRuleForMessage(text) {
+  const today = todayStrSaoPaulo();       // "YYYY-MM-DD"
+  const weekday = currentWeekdaySP();     // "seg"|"ter"|...|"dom"
+
+  for (const rule of BOT_RULES) {
+    // 1. Verifica período (se definido)
+    if (rule.validoDe && today < rule.validoDe) continue;
+    if (rule.validoAte && today > rule.validoAte) continue;
+    // 2. Verifica dias da semana (se definido — vazio = todos os dias)
+    if (rule.dias.length > 0 && !rule.dias.includes(weekday)) continue;
+    // 3. Verifica gatilho
+    if (rule.gatilhos.includes("qualquer")) return rule;
+    if (rule.gatilhos.includes("reserva") && looksLikeReservaIntent(text)) return rule;
+    if (rule.gatilhos.includes("promo") && looksLikePromoIntent(text)) return rule;
+    if (rule.gatilhos.includes("delivery") && looksLikeDeliveryIntent(text)) return rule;
+    if (rule.gatilhos.includes("horario") && looksLikeHorarioIntent(text)) return rule;
+    if (rule.gatilhos.includes("pedido") && looksLikeOrderIntent(text)) return rule;
+  }
+  return null;
+}
+
 // ===== Evolution send =====
 async function evolutionSendText({ remoteJid, text }) {
   const number = (remoteJid || "").split("@")[0];
@@ -711,9 +812,11 @@ Tom:
 Conteúdo:
 - Responda APENAS o que o cliente perguntou. Seja direto.
 - NÃO mencione promoções, descontos ou ofertas proativamente. Só fale de promoções se o cliente perguntar explicitamente sobre desconto ou promoção.
+- ANIVERSÁRIO: NUNCA mencione a promoção/política de aniversário (sobremesa de mimo, 5+1 rodízio) de forma proativa. Só fale sobre aniversário se o cliente mencionar explicitamente a palavra "aniversário", "aniversariante" ou "comemoração de aniversário".
 - NÃO envie links a menos que o cliente peça link.
+- HORÁRIOS: O restaurante funciona de segunda a sábado, das 18:30 às 23h. NUNCA diga "18h" ou "18:00" — o horário correto de abertura é 18:30 (dezoito e meia), sem exceção.
 - PREÇOS: NUNCA invente ou estime valores. Só mencione preços se estiverem literalmente nos trechos do Notion. Se não houver, diga que não tem essa informação no momento.
-- RESERVAS: reserva é OPCIONAL (o cliente pode vir sem reserva por ordem de chegada). Se o cliente perguntar se precisa reservar, como reservar, onde reservar ou qualquer coisa sobre reservas, diga que é opcional e que se quiser pode reservar pelo site tsunagari-site.vercel.app. Nunca instrua o cliente a enviar dados de reserva pelo WhatsApp.
+- RESERVAS: reserva é OPCIONAL (o cliente pode vir sem reserva por ordem de chegada). Se o cliente perguntar se precisa reservar, como reservar, onde reservar ou qualquer coisa sobre reservas, diga que é opcional e que se quiser pode reservar pelo site https://tsunagari-site.vercel.app. Nunca instrua o cliente a enviar dados de reserva pelo WhatsApp.
 - Não invente informações; use apenas os trechos fornecidos.
 - Se faltou informação, faça uma pergunta curta e objetiva.
 Formato:
@@ -1270,6 +1373,54 @@ async function handleWebhook(bodyJson) {
   const existing = getConv(state, remoteJid);
   if (existing?.handoffUntil && existing.handoffUntil > Date.now()) return;
 
+  // ===== Motor de Regras do Notion =====
+  if (incomingText) {
+    await ensureBotRulesFresh();
+    const activeRule = getActiveRuleForMessage(incomingText);
+    if (activeRule) {
+      console.log(`[${nowIso()}] regra_ativa jid=${remoteJid} titulo="${activeRule.titulo}" acao=${activeRule.acao}`);
+
+      if (activeRule.acao === "chamar_atendente") {
+        await handoffToHuman({ state, remoteJid, reason: `Regra ativa: ${activeRule.titulo}`, incomingText });
+        return;
+      }
+
+      if (activeRule.acao === "responder" && activeRule.conteudo) {
+        // Passa o conteúdo da regra pro OpenAI como contexto — ele monta a resposta naturalmente
+        await ensureKnowledgeFresh();
+        const faqRetrieved = simpleRetrieve(incomingText, KNOWLEDGE, 6);
+        const ruleItem = { db: "regra_ativa", name: activeRule.titulo, text: activeRule.conteudo };
+        const retrieved = [ruleItem, ...faqRetrieved]; // regra tem prioridade máxima
+
+        const ruleConv = getConv(state, remoteJid) || { mode: null, data: {} };
+        const history = (ruleConv.history || []).slice(-6);
+
+        const typingMs = Math.min(3000, 800 + incomingText.length * 20);
+        await evolutionSendTyping({ remoteJid, durationMs: typingMs });
+
+        let answer;
+        try {
+          answer = await openaiAnswer({ question: incomingText, retrieved, history });
+        } catch (e) {
+          console.error(`[${nowIso()}] regra_openai_failed`, e?.message || e);
+          answer = activeRule.conteudo; // fallback: manda o conteúdo direto
+        }
+
+        const safe = sanitizeAnswer(answer, incomingText);
+        await evolutionSendText({ remoteJid, text: safe });
+
+        ruleConv.history = [
+          ...history,
+          { role: "user", content: incomingText },
+          { role: "assistant", content: safe },
+        ].slice(-8);
+        setConv(state, remoteJid, ruleConv);
+        markBotReplied(state, remoteJid);
+        return;
+      }
+    }
+  }
+
   // Opt-out (cliente pediu para parar)
   if (looksLikeOptOut(incomingText)) {
     const msg = await getTemplate(
@@ -1421,9 +1572,9 @@ async function handleWebhook(bodyJson) {
 
     const reservaText = looksLikeReservaDuvida(incomingText)
       // Pessoa quer saber se é obrigatório → explica que é opcional
-      ? "As reservas são opcionais 😊 Você pode vir sem reserva, por ordem de chegada!\n\nMas se quiser garantir seu lugar, acesse nosso site 🍣\ntsuangari-site.vercel.app"
+      ? "As reservas são opcionais 😊 Você pode vir sem reserva, por ordem de chegada!\n\nMas se quiser garantir seu lugar, acesse nosso site 🍣\nhttps://tsunagari-site.vercel.app"
       // Pessoa quer reservar → só o link
-      : "Faça sua reserva pelo nosso site! 🍣\nAcesse: tsunagari-site.vercel.app";
+      : "Faça sua reserva pelo nosso site! 🍣\nAcesse: https://tsunagari-site.vercel.app";
 
     await evolutionSendText({ remoteJid, text: reservaText });
     markBotReplied(state, remoteJid);
@@ -1767,6 +1918,7 @@ const server = http.createServer((req, res) => {
   try {
     await loadKnowledge();
     await loadTemplates();
+    await loadBotRules();
   } catch (e) {
     console.error(`[${nowIso()}] initial_load_failed`, e?.message || e);
   }
