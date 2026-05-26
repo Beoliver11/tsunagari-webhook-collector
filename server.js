@@ -1821,7 +1821,16 @@ async function handleWebhook(bodyJson) {
   }
 
   // ===== FAQ (Notion + OpenAI) =====
-  const retrieved = simpleRetrieve(incomingText, KNOWLEDGE, 12);
+  // Se o cliente perguntou sobre promoção/delivery mas nenhuma regra estava ativa,
+  // injeta contexto explícito pra o OpenAI não inventar nem pescar promoções permanentes
+  await ensureBotRulesFresh();
+  const askedAboutPromo = looksLikePromoIntent(incomingText) || looksLikeDeliveryIntent(incomingText);
+  const hasActivePromoRule = askedAboutPromo && getActiveRuleForMessage(incomingText) !== null;
+  const noPromoCtx = askedAboutPromo && !hasActivePromoRule
+    ? [{ db: "regra_ativa", name: "Status promoções", text: "Não há nenhuma promoção especial ativa hoje. Se o cliente perguntar de promoção do dia, informe que hoje não temos promoção especial." }]
+    : [];
+
+  const retrieved = [...noPromoCtx, ...simpleRetrieve(incomingText, KNOWLEDGE, 12)];
 
   // Contexto: últimas 3 trocas da conversa
   const faqConv = getConv(state, remoteJid) || { mode: null, data: {} };
