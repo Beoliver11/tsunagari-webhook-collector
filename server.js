@@ -166,6 +166,15 @@ function looksLikeHorarioIntent(text) {
   return /\b(horario|hora|abre|abrem|fecha|fechado|funciona|funcionam|aberto|quando abre)\b/.test(t);
 }
 
+function looksLikeWantsHuman(text) {
+  const t = normalizeText(text);
+  return (
+    /\b(falar com|fala com|chamar|chama|quero|preciso|me passa|passa para|passando para)\b.{0,20}\b(atendente|humano|pessoa|alguem|responsavel|gerente)\b/.test(t) ||
+    /\b(atendente|humano|pessoa real|alguem real)\b.{0,20}\b(por favor|pf|pfv|agora|ja|me ajuda)\b/.test(t) ||
+    /\bquero (ser atendido|atendimento humano|falar com um humano|falar com uma pessoa)\b/.test(t) ||
+    t === "atendente" || t === "humano" || t === "falar com atendente" || t === "quero atendente"
+  );
+}
 function looksLikeOptOut(text) {
   const t = normalizeText(text);
   return /\b(parar|pare|stop|cancelar mensagens|nao quero receber|não quero receber|remover meu numero|remover meu número|descadastrar|sair|cancelar notificacoes|cancelar notificações)\b/.test(
@@ -1451,6 +1460,17 @@ async function handleWebhook(bodyJson) {
     await evolutionSendText({ remoteJid, text: msg });
     clearConv(state, remoteJid);
     markBotReplied(state, remoteJid);
+    return;
+  }
+
+  // Cliente pediu explicitamente para falar com atendente
+  if (looksLikeWantsHuman(incomingText)) {
+    await handoffToHuman({
+      state,
+      remoteJid,
+      reason: "cliente pediu atendimento humano",
+      incomingText,
+    });
     return;
   }
 
