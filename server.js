@@ -42,7 +42,7 @@ const {
   // NOVO (recomendado): Notion DBs por função
   NOTION_DB_FAQ = "2bf12169-2df7-806a-82cc-d8c1c3e39202", // DB — FAQ (Respostas)
   NOTION_DB_TEMPLATES = "516f3fa8-2a01-473d-ab97-e77c51ab4ae7", // DB — Templates (Mensagens prontas)
-  NOTION_DB_BOT_RULES = "952dc44d73e841fdbda0b1dc4ae5bbd1", // DB — Regras do Bot v2 (motor dinâmico)
+  NOTION_DB_BOT_RULES = "3988d97a6fb94ce397224dccaa9d41ef", // DB — Regras do Bot (Evento / Data / Dia da semana)
   NOTION_DB_CARDAPIO = "", // opcional
 
   // Antigo (compat): caso você ainda use os DBs antigos
@@ -555,7 +555,7 @@ async function loadBotRules() {
         "Notion-Version": "2022-06-28",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ page_size: 100 }), // sem filtro de checkbox — regra vale pelo período/dias
+      body: JSON.stringify({ page_size: 100 }),
     });
     const j = await r.json();
     if (!r.ok) throw new Error(`Notion rules failed ${r.status}: ${JSON.stringify(j)}`);
@@ -565,22 +565,18 @@ async function loadBotRules() {
         try {
           const props = p.properties;
           return {
-            titulo: (props["Regra"]?.title || []).map((t) => t.plain_text).join("") || "",
-            validoDe: props["Válido de"]?.date?.start || null,
-            validoAte: props["Válido até"]?.date?.start || null,
-            dias: (props["Dias da semana"]?.multi_select || []).map((d) => d.name),
-            gatilhos: (props["Gatilho"]?.multi_select || []).map((g) => g.name),
+            evento: (props["Evento"]?.title || []).map((t) => t.plain_text).join("") || "",
+            data: props["Data"]?.date?.start || null,          // "YYYY-MM-DD" ou null
+            diaSemana: props["Dia da semana"]?.select?.name || null, // "seg"|"ter"|...|null
             acao: props["Ação"]?.select?.name || "",
             conteudo: (props["Conteúdo"]?.rich_text || []).map((t) => t.plain_text).join("") || "",
-            prioridade: props["Prioridade"]?.number ?? 99,
           };
         } catch (_) {
           return null;
         }
       })
-      .filter(Boolean);
+      .filter((r) => r && r.evento && r.acao);
 
-    BOT_RULES.sort((a, b) => a.prioridade - b.prioridade);
     lastBotRulesLoadAt = Date.now();
     console.log(`[${nowIso()}] Bot rules loaded: ${BOT_RULES.length}`);
   } catch (e) {
@@ -593,23 +589,48 @@ async function ensureBotRulesFresh() {
   if (Date.now() - lastBotRulesLoadAt > maxAgeMs) await loadBotRules();
 }
 
-function getActiveRuleForMessage(text) {
-  const today = todayStrSaoPaulo();       // "YYYY-MM-DD"
-  const weekday = currentWeekdaySP();     // "seg"|"ter"|...|"dom"
+function extractEventKeywords(eventoName) {
+  // Palavras-chave derivadas do nome do evento (ignora palavras curtas e stopwords)
+  const stop = new Set(["de", "do", "da", "dos", "das", "um", "uma", "para", "com", "nos", "nas", "por", "que", "dia", "toda", "todo", "nos"]);
+  return normalizeText(eventoName)
+    .split(/\s+/)
+    .filter((w) => w.length > 3 && !stop.has(w));
+}
 
+function ruleMatchesMessage(rule, text) {
+  const t = normalizeText(text);
+  const today = todayStrSaoPaulo();
+  const keywords = extractEventKeywords(rule.evento);
+
+  if (rule.data) {
+    // Regra de data específica (ex: Dia dos Namorados = 12/06)
+    // 1. Hoje é a data do evento → qualquer mensagem dispara
+    if (today === rule.data) return true;
+    // 2. Mensagem menciona a data (ex: "12/06", "12 de junho")
+    const dateObj = parseDateBR(t);
+    if (dateObj) {
+      const mentioned = `${dateObj.yyyy}-${String(dateObj.mm).padStart(2, "0")}-${String(dateObj.dd).padStart(2, "0")}`;
+      if (mentioned === rule.data) return true;
+    }
+    // 3. Mensagem menciona palavras do nome do evento (ex: "namorado", "namorados")
+    if (keywords.length > 0 && keywords.some((kw) => t.includes(kw))) return true;
+    return false;
+  }
+
+  if (rule.diaSemana) {
+    // Regra recorrente por dia da semana (ex: sexta = promoção delivery)
+    if (currentWeekdaySP() !== rule.diaSemana) return false;
+    // Mensagem precisa ser sobre o tema (keywords do nome do evento)
+    if (keywords.length === 0) return true;
+    return keywords.some((kw) => t.includes(kw));
+  }
+
+  return false; // regra incompleta (sem data e sem dia da semana)
+}
+
+function getActiveRuleForMessage(text) {
   for (const rule of BOT_RULES) {
-    // 1. Verifica período (se definido)
-    if (rule.validoDe && today < rule.validoDe) continue;
-    if (rule.validoAte && today > rule.validoAte) continue;
-    // 2. Verifica dias da semana (se definido — vazio = todos os dias)
-    if (rule.dias.length > 0 && !rule.dias.includes(weekday)) continue;
-    // 3. Verifica gatilho
-    if (rule.gatilhos.includes("qualquer")) return rule;
-    if (rule.gatilhos.includes("reserva") && looksLikeReservaIntent(text)) return rule;
-    if (rule.gatilhos.includes("promo") && looksLikePromoIntent(text)) return rule;
-    if (rule.gatilhos.includes("delivery") && looksLikeDeliveryIntent(text)) return rule;
-    if (rule.gatilhos.includes("horario") && looksLikeHorarioIntent(text)) return rule;
-    if (rule.gatilhos.includes("pedido") && looksLikeOrderIntent(text)) return rule;
+    if (ruleMatchesMessage(rule, text)) return rule;
   }
   return null;
 }
