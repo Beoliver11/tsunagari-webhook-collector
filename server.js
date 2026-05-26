@@ -255,14 +255,22 @@ function currentWeekdaySP() {
 }
 function todayInfoSaoPaulo() {
   const now = new Date();
-  const fmtDate = new Intl.DateTimeFormat("pt-BR", {
+  const fmt = new Intl.DateTimeFormat("pt-BR", {
     timeZone: "America/Sao_Paulo",
     weekday: "long",
     day: "2-digit",
     month: "2-digit",
     year: "numeric",
   });
-  return fmtDate.format(now); // ex: "quarta-feira, 25/03/2026"
+  const tomorrow = new Date(now);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const fmtWeekday = new Intl.DateTimeFormat("pt-BR", {
+    timeZone: "America/Sao_Paulo",
+    weekday: "long",
+  });
+  const tomorrowName = fmtWeekday.format(tomorrow); // ex: "quarta-feira"
+  return `${fmt.format(now)} — amanhã será ${tomorrowName}`;
+  // ex: "terça-feira, 26/05/2026 — amanhã será quarta-feira"
 }
 function looksLikeOpenTodayQuestion(text) {
   const t = normalizeText(text);
