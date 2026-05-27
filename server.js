@@ -65,7 +65,7 @@ const {
   RESERVA_HORA_MAX = "19:45",
 
   // Calendar rules
-  FECHADO_DOMINGO = "1",
+  FECHADO_DOMINGO = "0",
   MAX_ADVANCE_DAYS = "120",
 } = process.env;
 
@@ -856,8 +856,8 @@ Conteúdo:
 - NÃO mencione promoções, descontos ou ofertas proativamente. Só fale de promoções se o cliente perguntar explicitamente sobre desconto ou promoção.
 - ANIVERSÁRIO: NUNCA mencione a promoção/política de aniversário de forma proativa. Só fale sobre aniversário se o cliente mencionar explicitamente a palavra "aniversário", "aniversariante" ou "comemoração de aniversário". Quando falar sobre aniversário, use APENAS as informações literalmente descritas nos trechos do Notion — NUNCA infira, complete ou extrapole detalhes que não estão escritos. Se o cliente perguntar algo específico sobre aniversário que não consta nos trechos (ex: qual tipo de rodízio o aniversariante ganha), diga que não tem essa informação no momento e sugira confirmar diretamente com o restaurante.
 - NÃO envie links a menos que o cliente peça link.
-- HORÁRIOS: O restaurante funciona de segunda a sábado, das 18:30 às 23h. NUNCA diga "18h" ou "18:00" — o horário correto de abertura é 18:30 (dezoito e meia), sem exceção.
-- PREÇOS: NUNCA invente ou estime valores. Só mencione preços se estiverem literalmente nos trechos do Notion. Se não houver, diga que não tem essa informação no momento.
+- HORÁRIOS: O restaurante funciona TODOS OS DIAS, das 18:30 às 23h. NUNCA diga "18h" ou "18:00" — o horário correto de abertura é 18:30 (dezoito e meia), sem exceção. NUNCA diga "segunda a sábado" — funcionamos todos os dias.
+- PREÇOS: Se os preços estiverem nos trechos do Notion, informe-os normalmente. NUNCA invente ou estime valores que não estejam nos trechos. Se não houver nenhum trecho com preço, diga que não tem essa informação no momento.
 - RESERVAS: reserva é OPCIONAL (o cliente pode vir sem reserva por ordem de chegada). Se o cliente perguntar se precisa reservar, como reservar, onde reservar ou qualquer coisa sobre reservas, diga que é opcional e que se quiser pode reservar pelo site https://tsunagari-site.vercel.app. Nunca instrua o cliente a enviar dados de reserva pelo WhatsApp.
 - Não invente informações; use apenas os trechos fornecidos.
 - Se faltou informação, faça uma pergunta curta e objetiva.
@@ -1561,11 +1561,11 @@ async function handleWebhook(bodyJson) {
     return;
   }
 
-  // "Abre hoje?" — domingo já tratado pelo guard acima; aqui só dias normais
+  // "Abre hoje?"
   if (looksLikeOpenTodayQuestion(incomingText)) {
     await evolutionSendText({
       remoteJid,
-      text: "Hoje a gente abre a partir das 18:30 e vai até 23h 🍣✨",
+      text: "Sim, abrimos hoje! Das 18:30 às 23h 🍣✨",
     });
     markBotReplied(state, remoteJid);
     return;
