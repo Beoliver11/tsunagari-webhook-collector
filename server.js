@@ -141,8 +141,6 @@ function looksLikeSofaRequest(text) {
 function looksLikeOrderIntent(text) {
   const t = normalizeText(text);
   return (
-    // apps de delivery com verbo de ação — quer fazer pedido pelo app
-    /\b(ifood|i-food|ubereats|uber eats|rappi)\b/.test(t) && !/\?/.test(t) ||
     // intenção explícita de pedir/pedido (evita "pedir informações", "pedir o cardápio")
     /\b(fazer um pedido|quero pedir|vou pedir|vou querer|meu pedido|numero do pedido)\b/.test(t) ||
     // retirar só em contexto de retirada de comida
