@@ -182,6 +182,12 @@ function looksLikeOptOut(text) {
   );
 }
 
+function isEmojiOnly(text) {
+  // Retorna true se a mensagem contém apenas emojis (e espaços) — sem texto real
+  const stripped = (text || "").replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}\s]/gu, "");
+  return stripped.length === 0 && (text || "").trim().length > 0;
+}
+
 function looksLikeGreeting(text) {
   // Saudação "pura", curta, e sem intenção junto
   const t = normalizeText(text);
@@ -1410,6 +1416,13 @@ async function handleWebhook(bodyJson) {
   // paused?
   const existing = getConv(state, remoteJid);
   if (existing?.handoffUntil && existing.handoffUntil > Date.now()) return;
+
+  // Mensagem só com emojis — responde com ❤️ gentil e encerra
+  if (incomingText && isEmojiOnly(incomingText)) {
+    await evolutionSendText({ remoteJid, text: "❤️" });
+    markBotReplied(state, remoteJid);
+    return;
+  }
 
   // ===== Motor de Regras do Notion =====
   if (incomingText) {
