@@ -811,14 +811,17 @@ function shouldAllowLinks(question) {
   return (
     q.includes("link") ||
     q.includes("cardapio") ||
-    q.includes("cardápio") ||
     q.includes("menu") ||
     q.includes("endereco") ||
-    q.includes("endereço") ||
     q.includes("maps") ||
     q.includes("localizacao") ||
-    q.includes("localização") ||
-    q.includes("como chegar")
+    q.includes("como chegar") ||
+    q.includes("site") ||
+    q.includes("grupo") ||
+    q.includes("tsulovers") ||
+    q.includes("instagram") ||
+    q.includes("reserva") ||
+    q.includes("reservar")
   );
 }
 function unmarkdownLinks(t) {
