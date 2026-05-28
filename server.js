@@ -612,10 +612,19 @@ async function ensureBotRulesFresh() {
 
 function extractEventKeywords(eventoName) {
   // Palavras-chave derivadas do nome do evento (ignora palavras curtas e stopwords)
-  const stop = new Set(["de", "do", "da", "dos", "das", "um", "uma", "para", "com", "nos", "nas", "por", "que", "dia", "toda", "todo", "nos"]);
+  // Divide também por / e - para nomes como "promoção/não reservar"
+  const stop = new Set(["de", "do", "da", "dos", "das", "um", "uma", "para", "com", "nos", "nas", "por", "que", "dia", "toda", "todo", "nos", "nao", "sem", "hoje"]);
   return normalizeText(eventoName)
-    .split(/\s+/)
+    .split(/[\s\/\-]+/)
     .filter((w) => w.length > 3 && !stop.has(w));
+}
+
+function keywordMatchesText(kw, t) {
+  // Match exato ou prefixo (ex: "reservar" bate com "reserva", "namorado" bate com "namorados")
+  if (t.includes(kw)) return true;
+  // prefixo: keyword começa com a palavra do texto ou vice-versa (conjugações/plural)
+  const words = t.split(/\s+/);
+  return words.some((w) => (w.length >= 4 && kw.startsWith(w)) || (kw.length >= 4 && w.startsWith(kw)));
 }
 
 function ruleMatchesMessage(rule, text) {
@@ -625,25 +634,29 @@ function ruleMatchesMessage(rule, text) {
 
   if (rule.data) {
     // Regra de data específica (ex: Dia dos Namorados = 12/06)
-    // 1. Hoje é a data do evento → qualquer mensagem dispara
-    if (today === rule.data) return true;
-    // 2. Mensagem menciona a data (ex: "12/06", "12 de junho")
+    if (today === rule.data) {
+      // Hoje é o dia do evento:
+      // - Se não tem keywords → dispara para qualquer mensagem (ex: "Fechado hoje")
+      // - Se tem keywords → só dispara se a mensagem for sobre o tema
+      if (keywords.length === 0) return true;
+      return keywords.some((kw) => keywordMatchesText(kw, t));
+    }
+    // Data futura/passada: mensagem menciona a data explicitamente
     const dateObj = parseDateBR(t);
     if (dateObj) {
       const mentioned = `${dateObj.yyyy}-${String(dateObj.mm).padStart(2, "0")}-${String(dateObj.dd).padStart(2, "0")}`;
       if (mentioned === rule.data) return true;
     }
-    // 3. Mensagem menciona palavras do nome do evento (ex: "namorado", "namorados")
-    if (keywords.length > 0 && keywords.some((kw) => t.includes(kw))) return true;
+    // Ou mensagem menciona palavras do nome do evento (ex: "namorado", "namorados")
+    if (keywords.length > 0 && keywords.some((kw) => keywordMatchesText(kw, t))) return true;
     return false;
   }
 
   if (rule.diaSemana) {
     // Regra recorrente por dia da semana (ex: sexta = promoção delivery)
     if (currentWeekdaySP() !== rule.diaSemana) return false;
-    // Mensagem precisa ser sobre o tema (keywords do nome do evento)
     if (keywords.length === 0) return true;
-    return keywords.some((kw) => t.includes(kw));
+    return keywords.some((kw) => keywordMatchesText(kw, t));
   }
 
   return false; // regra incompleta (sem data e sem dia da semana)
