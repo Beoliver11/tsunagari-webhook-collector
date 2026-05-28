@@ -186,6 +186,15 @@ function isEmojiOnly(text) {
   return stripped.length === 0 && (text || "").trim().length > 0;
 }
 
+function looksLikeCancelReserva(text) {
+  const t = normalizeText(text);
+  return (
+    /\b(cancelar|cancela|cancelamento|desmarcar|desmarca|desmarquei|cancelei|remover|tirar)\b.{0,30}\b(reserva|mesa|lugar)\b/.test(t) ||
+    /\b(reserva|mesa|lugar)\b.{0,30}\b(cancelar|cancela|cancelamento|desmarcar|desmarca)\b/.test(t) ||
+    /\b(nao|não)\s+(vou|vamos|consigo|podemos)\s+(mais\s+)?(ir|comparecer|aparecer)\b/.test(t)
+  );
+}
+
 function looksLikeGreeting(text) {
   // Saudação "pura", curta, e sem intenção junto
   const t = normalizeText(text);
@@ -1428,6 +1437,12 @@ async function handleWebhook(bodyJson) {
   // paused?
   const existing = getConv(state, remoteJid);
   if (existing?.handoffUntil && existing.handoffUntil > Date.now()) return;
+
+  // Cancelamento de reserva — chama atendente antes do motor de regras
+  if (incomingText && looksLikeCancelReserva(incomingText)) {
+    await handoffToHuman({ state, remoteJid, reason: "Cancelamento de reserva", incomingText });
+    return;
+  }
 
   // Mensagem só com emojis — responde com ❤️ gentil e encerra
   if (incomingText && isEmojiOnly(incomingText)) {
