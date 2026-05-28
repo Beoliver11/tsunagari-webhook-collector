@@ -637,9 +637,10 @@ function ruleMatchesMessage(rule, text) {
     if (today === rule.data) {
       // Hoje é o dia do evento:
       // - Se não tem keywords → dispara para qualquer mensagem (ex: "Fechado hoje")
-      // - Se tem keywords → só dispara se a mensagem for sobre o tema
+      // - Se tem keywords → exige TODAS as keywords na mensagem (mais preciso)
+      //   Ex: "reserva hoje" → só dispara se a mensagem tiver "reserva" E "hoje"
       if (keywords.length === 0) return true;
-      return keywords.some((kw) => keywordMatchesText(kw, t));
+      return keywords.every((kw) => keywordMatchesText(kw, t));
     }
     // Data futura/passada: mensagem menciona a data explicitamente
     const dateObj = parseDateBR(t);
@@ -1448,28 +1449,15 @@ async function handleWebhook(bodyJson) {
       }
 
       if (activeRule.acao === "responder" && activeRule.conteudo) {
-        // Passa o conteúdo da regra pro OpenAI como contexto — ele monta a resposta naturalmente
-        await ensureKnowledgeFresh();
-        const faqRetrieved = simpleRetrieve(incomingText, KNOWLEDGE, 6);
-        const ruleItem = { db: "regra_ativa", name: activeRule.titulo, text: activeRule.conteudo };
-        const retrieved = [ruleItem, ...faqRetrieved]; // regra tem prioridade máxima
-
+        // Envia o conteúdo da regra DIRETAMENTE — sem passar pelo OpenAI.
+        // O usuário controla a mensagem exata no campo "Conteúdo" do Notion.
         const ruleConv = getConv(state, remoteJid) || { mode: null, data: {} };
         const history = (ruleConv.history || []).slice(-6);
 
-        const typingMs = Math.min(3000, 800 + incomingText.length * 20);
+        const typingMs = Math.min(2000, 600 + activeRule.conteudo.length * 15);
         await evolutionSendTyping({ remoteJid, durationMs: typingMs });
 
-        let answer;
-        try {
-          answer = await openaiAnswer({ question: incomingText, retrieved, history });
-        } catch (e) {
-          console.error(`[${nowIso()}] regra_openai_failed`, e?.message || e);
-          answer = activeRule.conteudo; // fallback: manda o conteúdo direto
-        }
-
-        const safe = sanitizeAnswer(answer, incomingText);
-        await evolutionSendText({ remoteJid, text: safe });
+        await evolutionSendText({ remoteJid, text: activeRule.conteudo });
 
         ruleConv.history = [
           ...history,
