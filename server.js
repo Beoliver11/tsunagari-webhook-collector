@@ -14,6 +14,10 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 
+// Lock em memória: evita que duas mensagens do mesmo número sejam processadas
+// simultaneamente (race condition no state.json)
+const PROCESSING_LOCK = new Set();
+
 // ===== ENV =====
 const {
   // OpenAI
@@ -880,6 +884,8 @@ Tom:
 Conteúdo:
 - Responda APENAS o que o cliente perguntou. Seja direto.
 - NÃO mencione promoções, descontos ou ofertas proativamente. Só fale de promoções se o cliente perguntar explicitamente sobre desconto ou promoção.
+- CARDÁPIO: O restaurante NÃO tem "barca" — o nome correto é "combinado". Se o cliente perguntar sobre barca, corrija gentilmente dizendo que trabalhamos com combinados.
+- PROMOÇÕES DO GRUPO TSULOVERS: Se o cliente mencionar uma promoção do grupo de WhatsApp Tsulovers, responda sobre ESSA promoção específica (use os trechos do Notion). NUNCA confunda com a promoção de aniversário.
 - ANIVERSÁRIO: NUNCA mencione a promoção/política de aniversário de forma proativa. Só fale sobre aniversário se o cliente mencionar explicitamente a palavra "aniversário", "aniversariante" ou "comemoração de aniversário". Quando falar sobre aniversário, use APENAS as informações literalmente descritas nos trechos do Notion — NUNCA infira, complete ou extrapole detalhes que não estão escritos. Se o cliente perguntar algo específico sobre aniversário que não consta nos trechos (ex: qual tipo de rodízio o aniversariante ganha), diga que não tem essa informação no momento e sugira confirmar diretamente com o restaurante.
 - NÃO envie links a menos que o cliente peça link.
 - HORÁRIOS: O restaurante funciona TODOS OS DIAS, das 18:30 às 23h. NUNCA diga "18h" ou "18:00" — o horário correto de abertura é 18:30 (dezoito e meia), sem exceção. NUNCA diga "segunda a sábado" — funcionamos todos os dias.
@@ -1427,6 +1433,16 @@ async function handleWebhook(bodyJson) {
   const mediaType = !incomingText ? extractIncomingMediaType(bodyJson) : null;
   if (!incomingText && !mediaType) return;
 
+  // Lock por JID: evita race condition quando 2 mensagens chegam ao mesmo tempo
+  if (PROCESSING_LOCK.has(remoteJid)) {
+    // Aguarda brevemente e tenta de novo (a primeira já deve ter terminado)
+    await new Promise((r) => setTimeout(r, 800));
+    if (PROCESSING_LOCK.has(remoteJid)) return; // ainda ocupado, descarta
+  }
+  PROCESSING_LOCK.add(remoteJid);
+
+  try {
+
   const state = loadState();
 
   const msgId = getIncomingMessageId(bodyJson);
@@ -1480,7 +1496,7 @@ async function handleWebhook(bodyJson) {
         ruleConv.history = [
           ...history,
           { role: "user", content: incomingText },
-          { role: "assistant", content: safe },
+          { role: "assistant", content: activeRule.conteudo },
         ].slice(-8);
         setConv(state, remoteJid, ruleConv);
         markBotReplied(state, remoteJid);
@@ -1940,6 +1956,10 @@ async function handleWebhook(bodyJson) {
   ].slice(-8);
   setConv(state, remoteJid, faqConv);
   markBotReplied(state, remoteJid);
+
+  } finally {
+    PROCESSING_LOCK.delete(remoteJid);
+  }
 }
 
 // ===== HTTP server =====
