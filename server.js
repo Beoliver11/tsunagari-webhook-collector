@@ -443,7 +443,7 @@ async function notionQueryAllRowsFlexible(dbId, pageSize = 100) {
       const titleProp = notionPickProp(p, ["Título", "Titulo", "Nome", "Nome do template", "Name"]);
       const textProp = notionPickProp(p, ["Resposta", "Texto", "Mensagem", "Valor", "Text"]);
       const catProp = notionPickProp(p, ["Categoria", "Tipo"]);
-      const kwProp = notionPickProp(p, ["Palavras-chave", "Palavras chave", "Palavras_chave", "Keywords"]);
+      const kwProp = notionPickProp(p, ["Palavras-chaves", "Palavras-chave", "Palavras chave", "Palavras_chave", "Keywords"]);
       const activeProp = notionPickProp(p, ["Ativo", "Ativa", "Active"]);
 
       const name = notionTextFromProp(titleProp).trim();
