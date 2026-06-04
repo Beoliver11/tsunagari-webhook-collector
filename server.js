@@ -69,7 +69,7 @@ const {
   RESERVA_HORA_MAX = "19:45",
 
   // Calendar rules
-  FECHADO_DOMINGO = "0",
+  FECHADO_DOMINGO = "1",
   MAX_ADVANCE_DAYS = "120",
 } = process.env;
 
@@ -171,10 +171,11 @@ function looksLikeHorarioIntent(text) {
 function looksLikeWantsHuman(text) {
   const t = normalizeText(text);
   return (
-    /\b(falar com|fala com|chamar|chama|quero|preciso|me passa|passa para|passando para)\b.{0,20}\b(atendente|humano|pessoa|alguem|responsavel|gerente)\b/.test(t) ||
-    /\b(atendente|humano|pessoa real|alguem real)\b.{0,20}\b(por favor|pf|pfv|agora|ja|me ajuda)\b/.test(t) ||
-    /\bquero (ser atendido|atendimento humano|falar com um humano|falar com uma pessoa)\b/.test(t) ||
-    t === "atendente" || t === "humano" || t === "falar com atendente" || t === "quero atendente"
+    /\b(falar com|fala com|chamar|chama|quero|preciso|me passa|passa para|passando para)\b.{0,30}\b(atendente|atendentes|humano|humana|pessoa|alguem|responsavel|gerente|assistente)\b/.test(t) ||
+    /\b(atendente|humano|humana|pessoa real|alguem real|assistente humana?)\b.{0,20}\b(por favor|pf|pfv|agora|ja|me ajuda)\b/.test(t) ||
+    /\bquero (ser atendido|atendimento humano|falar com um humano|falar com uma pessoa|falar com assistente)\b/.test(t) ||
+    /\b(assistente humana?|atendimento humano)\b/.test(t) ||
+    t === "atendente" || t === "humano" || t === "humana" || t === "falar com atendente" || t === "quero atendente"
   );
 }
 function looksLikeOptOut(text) {
@@ -888,7 +889,7 @@ Conteúdo:
 - PROMOÇÕES DO GRUPO TSULOVERS: Se o cliente mencionar uma promoção do grupo de WhatsApp Tsulovers, responda sobre ESSA promoção específica (use os trechos do Notion). NUNCA confunda com a promoção de aniversário.
 - ANIVERSÁRIO: NUNCA mencione a promoção/política de aniversário de forma proativa. Só fale sobre aniversário se o cliente mencionar explicitamente a palavra "aniversário", "aniversariante" ou "comemoração de aniversário". Quando falar sobre aniversário, use APENAS as informações literalmente descritas nos trechos do Notion — NUNCA infira, complete ou extrapole detalhes que não estão escritos. Se o cliente perguntar algo específico sobre aniversário que não consta nos trechos (ex: qual tipo de rodízio o aniversariante ganha), diga que não tem essa informação no momento e sugira confirmar diretamente com o restaurante.
 - NÃO envie links a menos que o cliente peça link.
-- HORÁRIOS: O restaurante funciona TODOS OS DIAS, das 18:30 às 23h. NUNCA diga "18h" ou "18:00" — o horário correto de abertura é 18:30 (dezoito e meia), sem exceção. NUNCA diga "segunda a sábado" — funcionamos todos os dias.
+- HORÁRIOS: O restaurante funciona de segunda a sábado, das 18:30 às 23h. NUNCA diga "18h" ou "18:00" — o horário correto de abertura é 18:30 (dezoito e meia), sem exceção. DOMINGOS: o restaurante está FECHADO aos domingos.
 - PREÇOS: Se os preços estiverem nos trechos do Notion, informe-os normalmente. NUNCA invente ou estime valores que não estejam nos trechos. Se não houver nenhum trecho com preço, diga que não tem essa informação no momento. IMPORTANTE: o preço do rodízio é FIXO e não muda por data — se o cliente perguntar o valor "para o dia X" ou "para a data Y", responda com o preço padrão do Notion (não existe preço especial por data, a menos que haja uma promoção explícita nos trechos).
 - RESERVAS: reserva é OPCIONAL (o cliente pode vir sem reserva por ordem de chegada). Se o cliente perguntar se precisa reservar, como reservar, onde reservar ou qualquer coisa sobre reservas, diga que é opcional e que se quiser pode reservar pelo site https://tsunagari-site.vercel.app. Nunca instrua o cliente a enviar dados de reserva pelo WhatsApp.
 - Não invente informações; use apenas os trechos fornecidos.
