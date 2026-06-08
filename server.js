@@ -756,11 +756,11 @@ async function notifyHumans(text) {
  * - PAUSA o chat por HANDOFF_MINUTES (para o bot não ficar atrapalhando)
  * - NÃO cria card no Trello
  */
-async function handoffToHuman({ state, remoteJid, reason, incomingText }) {
+async function handoffToHuman({ state, remoteJid, reason, incomingText, customClientMsg }) {
   const from = remoteJid.split("@")[0];
 
-  // 1. Mensagem pro cliente (template Notion ou fallback)
-  const clientMsg = await getTemplate(
+  // 1. Mensagem pro cliente (template Notion ou fallback, ou customizada)
+  const clientMsg = customClientMsg || await getTemplate(
     "HANDOFF_CLIENTE",
     "Entendi. Só um instante que vou chamar um atendente pra te ajudar direitinho por aqui. 🙏"
   ).catch(() => "Entendi. Só um instante que vou chamar um atendente pra te ajudar direitinho por aqui. 🙏");
@@ -1733,6 +1733,19 @@ async function handleWebhook(bodyJson) {
 
     setConv(state, remoteJid, conv);
 
+    // Early check: grupo grande => handoff imediato (sem precisar coletar mais dados)
+    if (pessoasTotal != null && Number(pessoasTotal) >= 12) {
+      const np = Number(pessoasTotal);
+      await handoffToHuman({
+        state,
+        remoteJid,
+        incomingText,
+        reason: `grupo grande (${np} pessoas) — garantia de R$50/assento necessária`,
+        customClientMsg: `Para reservas de ${np} pessoas, trabalhamos com uma garantia de reserva de R$50 por assento (totalmente reembolsado no dia da visita 🙂). Vou chamar um atendente para confirmar os detalhes contigo! 🙏`,
+      });
+      return;
+    }
+
     // date validations
     if (conv.data.dateObj) {
       if (FECHADO_DOMINGO !== "0" && isSundayBR(conv.data.dateObj)) {
@@ -1812,13 +1825,14 @@ async function handleWebhook(bodyJson) {
     const maxTotal = Number(RESERVA_MAX_TOTAL_DIA);
     const n = Number(conv.data.pessoasTotal);
 
-    // Gatilho: 12+ pessoas => handoff
+    // Gatilho: 12+ pessoas => handoff (safety net — normalmente já disparado antes)
     if (n >= 12) {
       await handoffToHuman({
         state,
         remoteJid,
-        reason: `grupo grande (${n} pessoas) — requer atendimento manual`,
         incomingText,
+        reason: `grupo grande (${n} pessoas) — garantia de R$50/assento necessária`,
+        customClientMsg: `Para reservas de ${n} pessoas, trabalhamos com uma garantia de reserva de R$50 por assento (totalmente reembolsado no dia da visita 🙂). Vou chamar um atendente para confirmar os detalhes contigo! 🙏`,
       });
       return;
     }
