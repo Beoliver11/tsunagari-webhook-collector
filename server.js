@@ -151,8 +151,10 @@ function looksLikeOrderIntent(text) {
     /\b(retirar no local|retirar o pedido|buscar o pedido|quero retirar|posso retirar|fazer retirada|para retirar|vou retirar|retirada do pedido)\b/.test(t) ||
     // "retirada" sozinha (sem contexto de reserva) — ex: "tem retirada?", "aceita retirada"
     (/\bretirada\b/.test(t) && !t.includes("reserva")) ||
+    // encomendar sozinho já indica pedido antecipado (ex: "posso encomendar e retirar amanhã")
+    /\bencomendar\b/.test(t) ||
     // delivery/entrega + verbo de ação explícito (não só "tem delivery?")
-    /\b(pedir|encomendar|fazer pedido)\b.{0,30}\b(delivery|entrega)\b/.test(t) ||
+    /\b(pedir|fazer pedido)\b.{0,30}\b(delivery|entrega)\b/.test(t) ||
     /\b(delivery|entrega)\b.{0,30}\b(quero|vou|posso pedir|fazer pedido)\b/.test(t)
   );
 }
