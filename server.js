@@ -147,8 +147,10 @@ function looksLikeOrderIntent(text) {
   return (
     // intenção explícita de pedir/pedido (evita "pedir informações", "pedir o cardápio")
     /\b(fazer um pedido|quero pedir|vou pedir|vou querer|meu pedido|numero do pedido)\b/.test(t) ||
-    // retirar só em contexto de retirada de comida
-    /\b(retirar no local|retirar o pedido|buscar o pedido)\b/.test(t) ||
+    // retirar em contexto de comida (todas as variações)
+    /\b(retirar no local|retirar o pedido|buscar o pedido|quero retirar|posso retirar|fazer retirada|para retirar|vou retirar|retirada do pedido)\b/.test(t) ||
+    // "retirada" sozinha (sem contexto de reserva) — ex: "tem retirada?", "aceita retirada"
+    (/\bretirada\b/.test(t) && !t.includes("reserva")) ||
     // delivery/entrega + verbo de ação explícito (não só "tem delivery?")
     /\b(pedir|encomendar|fazer pedido)\b.{0,30}\b(delivery|entrega)\b/.test(t) ||
     /\b(delivery|entrega)\b.{0,30}\b(quero|vou|posso pedir|fazer pedido)\b/.test(t)
@@ -656,12 +658,17 @@ function ruleMatchesMessage(rule, text) {
       if (keywords.length === 0) return true;
       return keywords.every((kw) => keywordMatchesText(kw, t));
     }
-    // Data futura/passada: mensagem menciona a data explicitamente
+    // Data futura/passada: mensagem menciona a data explicitamente (DD/MM ou por nome do mês)
     const dateObj = parseDateBR(t);
     if (dateObj) {
       const mentioned = `${dateObj.yyyy}-${String(dateObj.mm).padStart(2, "0")}-${String(dateObj.dd).padStart(2, "0")}`;
       if (mentioned === rule.data) return true;
     }
+    // "dia DD" sem mês — confere se o dia bate e a data é próxima (até 14 dias)
+    const ruleDay = Number(rule.data.split("-")[2]);
+    const ruleTs = new Date(rule.data + "T12:00:00Z").getTime();
+    const daysAhead = Math.floor((ruleTs - Date.now()) / 86400000);
+    if (daysAhead >= 0 && daysAhead <= 14 && new RegExp(`\\bdia\\s*${ruleDay}\\b`).test(t)) return true;
     // Ou mensagem menciona palavras do nome do evento (ex: "namorado", "namorados")
     if (keywords.length > 0 && keywords.some((kw) => keywordMatchesText(kw, t))) return true;
     return false;
@@ -719,6 +726,68 @@ async function evolutionSendTyping({ remoteJid, durationMs = 1500 }) {
   } catch {
     // typing indicator é best-effort; ignora erros
   }
+}
+
+// Baixa mídia (imagem/áudio) da Evolution API como base64
+async function evolutionGetMediaBase64(bodyJson) {
+  const url =
+    EVOLUTION_SERVER_URL.replace(/\/$/, "") +
+    "/chat/getBase64FromMediaMessage/" +
+    encodeURIComponent(EVOLUTION_INSTANCE);
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", apikey: EVOLUTION_APIKEY },
+    body: JSON.stringify({ message: bodyJson.data, convertToMp4: false }),
+  });
+  if (!r.ok) throw new Error(`Evolution media download failed ${r.status}`);
+  const j = await r.json();
+  return { base64: j.base64 || null, mimetype: j.mimetype || "application/octet-stream" };
+}
+
+// Descreve imagem com GPT-4o Vision
+async function openaiDescribeImage(base64, mimetype = "image/jpeg") {
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image_url", image_url: { url: `data:${mimetype};base64,${base64}`, detail: "low" } },
+            { type: "text", text: "Você é assistente de um restaurante japonês chamado Tsunagari. O cliente enviou essa imagem. Descreva objetivamente em 1-2 frases o que você vê, especialmente se for um prato de comida. Se houver texto legível, transcreva-o. Responda em português." },
+          ],
+        },
+      ],
+      max_tokens: 200,
+    }),
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error(`OpenAI Vision failed: ${JSON.stringify(j)}`);
+  return j.choices?.[0]?.message?.content?.trim() || null;
+}
+
+// Transcreve áudio com Whisper
+async function openaiTranscribeAudio(base64, mimetype = "audio/ogg") {
+  const buffer = Buffer.from(base64, "base64");
+  const ext = mimetype.includes("mp4") ? "mp4" : mimetype.includes("mpeg") ? "mp3" : "ogg";
+  const boundary = `----WA${Date.now()}`;
+  const body = Buffer.concat([
+    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.${ext}"\r\nContent-Type: ${mimetype}\r\n\r\n`),
+    buffer,
+    Buffer.from(`\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n`),
+    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\npt\r\n`),
+    Buffer.from(`--${boundary}--\r\n`),
+  ]);
+  const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": `multipart/form-data; boundary=${boundary}` },
+    body,
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error(`Whisper failed: ${JSON.stringify(j)}`);
+  return j.text?.trim() || null;
 }
 
 async function notifyAdmin(text) {
@@ -886,6 +955,7 @@ Conteúdo:
 - Responda APENAS o que o cliente perguntou. Seja direto.
 - NÃO mencione promoções, descontos ou ofertas proativamente. Só fale de promoções se o cliente perguntar explicitamente sobre desconto ou promoção.
 - CARDÁPIO: O restaurante NÃO tem "barca" — o nome correto é "combinado". Se o cliente perguntar sobre barca, corrija gentilmente dizendo que trabalhamos com combinados.
+- RODÍZIO TRADICIONAL vs PREMIUM: O rodízio TRADICIONAL inclui apenas as peças básicas (sushis, sashimis e temakis básicos do cardápio padrão). NÃO inclui todos os temakis — apenas os temakis básicos. O rodízio PREMIUM inclui opções premium e variedades maiores. Se o cliente perguntar se pode pedir "todos os temakis" no tradicional, diga que o tradicional tem apenas os temakis básicos do cardápio padrão — para os temakis especiais/premium é necessário o rodízio premium. Se não houver informação detalhada nos trechos do Notion, diga que não tem essa informação e sugira confirmar com o restaurante.
 - PROMOÇÕES DO GRUPO TSULOVERS: Se o cliente mencionar uma promoção do grupo de WhatsApp Tsulovers, responda sobre ESSA promoção específica (use os trechos do Notion). NUNCA confunda com a promoção de aniversário.
 - ANIVERSÁRIO: NUNCA mencione a promoção/política de aniversário de forma proativa. Só fale sobre aniversário se o cliente mencionar explicitamente a palavra "aniversário", "aniversariante" ou "comemoração de aniversário". Quando falar sobre aniversário, use APENAS as informações literalmente descritas nos trechos do Notion — NUNCA infira, complete ou extrapole detalhes que não estão escritos. Se o cliente perguntar algo específico sobre aniversário que não consta nos trechos (ex: qual tipo de rodízio o aniversariante ganha), diga que não tem essa informação no momento e sugira confirmar diretamente com o restaurante.
 - NÃO envie links a menos que o cliente peça link.
@@ -1585,16 +1655,74 @@ async function handleWebhook(bodyJson) {
 
   await ensureKnowledgeFresh();
 
-  // Mídia sem texto (foto, áudio, sticker, documento sem legenda)
+  // Mídia sem texto
   if (mediaType && !incomingText) {
-    const mediaMsg = await getTemplate(
-      "MEDIA_SEM_TEXTO",
-      "Recebi! Me escreve o que precisa que te ajudo 😊"
-    );
+    if (mediaType === "audio") {
+      // Transcreve áudio com Whisper e processa como texto normal
+      try {
+        await evolutionSendTyping({ remoteJid, durationMs: 1200 });
+        const { base64, mimetype } = await evolutionGetMediaBase64(bodyJson);
+        if (base64) {
+          const transcription = await openaiTranscribeAudio(base64, mimetype);
+          if (transcription && transcription.length > 2) {
+            console.log(`[${nowIso()}] whisper_transcription jid=${remoteJid} text="${transcription.slice(0,80)}"`);
+            // Reprocessa como mensagem de texto normal
+            bodyJson.data.message = { conversation: transcription };
+            await handleWebhook(bodyJson);
+            return;
+          }
+        }
+      } catch (e) {
+        console.error(`[${nowIso()}] whisper_error`, e?.message || e);
+      }
+      // fallback se transcrição falhar
+      await evolutionSendText({ remoteJid, text: "Recebi o áudio! Me escreve o que precisa que te ajudo 😊" });
+      markBotReplied(state, remoteJid);
+      return;
+    }
+
+    if (mediaType === "image") {
+      // Descreve imagem com Vision e pede o que o cliente precisa
+      try {
+        await evolutionSendTyping({ remoteJid, durationMs: 1500 });
+        const { base64, mimetype } = await evolutionGetMediaBase64(bodyJson);
+        if (base64) {
+          const description = await openaiDescribeImage(base64, mimetype);
+          if (description) {
+            // Usa a descrição como pergunta para o FAQ
+            const faqConv = getConv(state, remoteJid) || { mode: null, data: {} };
+            const history = (faqConv.history || []).slice(-6);
+            const retrieved = simpleRetrieve(description, KNOWLEDGE, 8);
+            const answer = await openaiAnswer({ question: description, retrieved, history }).catch(() => null);
+            if (answer) {
+              await evolutionSendText({ remoteJid, text: answer });
+              faqConv.history = [...history, { role: "user", content: `[imagem] ${description}` }, { role: "assistant", content: answer }].slice(-8);
+              setConv(state, remoteJid, faqConv);
+              markBotReplied(state, remoteJid);
+              return;
+            }
+          }
+        }
+      } catch (e) {
+        console.error(`[${nowIso()}] vision_error`, e?.message || e);
+      }
+      // fallback
+      await evolutionSendText({ remoteJid, text: "Recebi a foto! Me escreve o que precisa que te ajudo 😊" });
+      markBotReplied(state, remoteJid);
+      return;
+    }
+
+    // sticker, documento, vídeo sem legenda
+    const mediaMsg = await getTemplate("MEDIA_SEM_TEXTO", "Recebi! Me escreve o que precisa que te ajudo 😊");
     await evolutionSendTyping({ remoteJid, durationMs: 800 });
     await evolutionSendText({ remoteJid, text: mediaMsg });
     markBotReplied(state, remoteJid);
     return;
+  }
+
+  // Imagem COM legenda — também analisa a imagem para enriquecer a resposta
+  if (!incomingText && bodyJson?.data?.message?.imageMessage?.caption) {
+    // já capturado em incomingText via extractIncomingText — nenhuma ação extra necessária
   }
 
   // "Abre hoje?"
