@@ -701,6 +701,8 @@ const CHATWOOT_INBOX_ID = parseInt(process.env.CHATWOOT_INBOX_ID || "1", 10);
 // Cache phone → { contactId, conversationId, ts }
 const _cwCache = new Map();
 const CW_CACHE_TTL = 30 * 60 * 1000;
+// Rastreia mensagens enviadas pelo bot para evitar loop com webhook do Chatwoot
+const _cwBotSent = new Set();
 
 async function chatwootSync(remoteJid, text, direction) {
   if (!CHATWOOT_URL || !CHATWOOT_TOKEN || !text) return;
@@ -744,6 +746,11 @@ async function chatwootSync(remoteJid, text, direction) {
       _cwCache.set(phone, cached);
     }
 
+    if (direction === "outgoing") {
+      const k = text.slice(0, 80);
+      _cwBotSent.add(k);
+      setTimeout(() => _cwBotSent.delete(k), 15000);
+    }
     await fetch(`${base}/conversations/${cached.conversationId}/messages`, {
       method: "POST", headers: h,
       body: JSON.stringify({ content: text, message_type: direction, private: false }),
@@ -2204,6 +2211,42 @@ const server = http.createServer((req, res) => {
     });
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
     return res.end(payload);
+  }
+
+  // ===== Chatwoot reply webhook (Flavia → WhatsApp) =====
+  if (req.method === "POST" && req.url === "/chatwoot-webhook") {
+    let cwBuf = [];
+    req.on("data", (c) => cwBuf.push(c));
+    req.on("end", async () => {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("OK");
+      let cwBody;
+      try { cwBody = JSON.parse(Buffer.concat(cwBuf).toString("utf8")); } catch { return; }
+      if (!cwBody || cwBody.event !== "message_created") return;
+      if (cwBody.message_type !== "outgoing") return;
+      const content = cwBody.content;
+      if (!content || !content.trim()) return;
+      // Loop prevention: ignora mensagens que o próprio bot acabou de enviar
+      const k = content.slice(0, 80);
+      if (_cwBotSent.has(k)) { _cwBotSent.delete(k); return; }
+      // Pega telefone do contato da conversa
+      const phone = (cwBody.conversation?.meta?.sender?.phone_number || "").replace(/\D/g, "");
+      if (!phone) return;
+      // Envia via WhatsApp sem chamar chatwootSync (mensagem já está no Chatwoot)
+      try {
+        const waUrl = `https://graph.facebook.com/v21.0/${WA_PHONE_NUMBER_ID}/messages`;
+        const r = await fetch(waUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${WA_TOKEN}` },
+          body: JSON.stringify({ messaging_product: "whatsapp", to: phone, type: "text", text: { body: content } }),
+        });
+        if (r.ok) console.log(`[cw_reply] Enviado "${content.slice(0, 40)}" → ${phone}`);
+        else console.error(`[cw_reply] WA erro ${r.status}: ${await r.text()}`);
+      } catch (e) {
+        console.error(`[cw_reply] ${e.message}`);
+      }
+    });
+    return;
   }
 
   let buf = [];
