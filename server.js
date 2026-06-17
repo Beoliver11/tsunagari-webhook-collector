@@ -692,6 +692,67 @@ function getActiveRuleForMessage(text) {
   return null;
 }
 
+// ===== Chatwoot sync =====
+const CHATWOOT_URL = process.env.CHATWOOT_URL || "";
+const CHATWOOT_TOKEN = process.env.CHATWOOT_TOKEN || "";
+const CHATWOOT_ACCOUNT_ID = process.env.CHATWOOT_ACCOUNT_ID || "2";
+const CHATWOOT_INBOX_ID = parseInt(process.env.CHATWOOT_INBOX_ID || "1", 10);
+
+// Cache phone → { contactId, conversationId, ts }
+const _cwCache = new Map();
+const CW_CACHE_TTL = 30 * 60 * 1000;
+
+async function chatwootSync(remoteJid, text, direction) {
+  if (!CHATWOOT_URL || !CHATWOOT_TOKEN || !text) return;
+  try {
+    const phone = (remoteJid || "").split("@")[0].replace(/\D/g, "");
+    if (!phone) return;
+    const h = { "Content-Type": "application/json", "api_access_token": CHATWOOT_TOKEN };
+    const base = `${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}`;
+
+    let cached = _cwCache.get(phone);
+    if (cached && Date.now() - cached.ts > CW_CACHE_TTL) cached = null;
+
+    if (!cached) {
+      // find or create contact
+      const sr = await fetch(`${base}/contacts/search?q=${encodeURIComponent(`+${phone}`)}&include_contacts=true`, { headers: h });
+      const sd = await sr.json();
+      let contactId = sd?.payload?.[0]?.id;
+      if (!contactId) {
+        const cr = await fetch(`${base}/contacts`, {
+          method: "POST", headers: h,
+          body: JSON.stringify({ phone_number: `+${phone}`, name: phone }),
+        });
+        contactId = (await cr.json())?.id;
+      }
+      if (!contactId) return;
+
+      // find open conversation or create one
+      const cvr = await fetch(`${base}/contacts/${contactId}/conversations`, { headers: h });
+      const cvd = await cvr.json();
+      let conversationId = cvd?.payload?.find(c => c.inbox_id === CHATWOOT_INBOX_ID && c.status !== "resolved")?.id;
+      if (!conversationId) {
+        const ncr = await fetch(`${base}/conversations`, {
+          method: "POST", headers: h,
+          body: JSON.stringify({ contact_id: contactId, inbox_id: CHATWOOT_INBOX_ID }),
+        });
+        conversationId = (await ncr.json())?.id;
+      }
+      if (!conversationId) return;
+
+      cached = { contactId, conversationId, ts: Date.now() };
+      _cwCache.set(phone, cached);
+    }
+
+    await fetch(`${base}/conversations/${cached.conversationId}/messages`, {
+      method: "POST", headers: h,
+      body: JSON.stringify({ content: text, message_type: direction, private: false }),
+    });
+  } catch (e) {
+    console.error(`[chatwoot_sync] ${e?.message}`);
+  }
+}
+
 // ===== WhatsApp Cloud API send =====
 async function waSendText({ remoteJid, text }) {
   const to = (remoteJid || "").split("@")[0];
@@ -703,6 +764,7 @@ async function waSendText({ remoteJid, text }) {
   });
   const body = await r.text();
   if (!r.ok) throw new Error(`WA send failed ${r.status}: ${body}`);
+  chatwootSync(remoteJid, text, "outgoing").catch(() => {});
   return body;
 }
 
@@ -1511,6 +1573,9 @@ async function handleWebhook(bodyJson) {
   const incomingText = extractIncomingText(bodyJson);
   const mediaType = !incomingText ? extractIncomingMediaType(bodyJson) : null;
   if (!incomingText && !mediaType) return;
+
+  // Espelha mensagem recebida no Chatwoot
+  if (incomingText) chatwootSync(remoteJid, incomingText, "incoming").catch(() => {});
 
   // Lock por JID: evita race condition quando 2 mensagens chegam ao mesmo tempo
   if (PROCESSING_LOCK.has(remoteJid)) {
