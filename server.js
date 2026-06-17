@@ -912,15 +912,17 @@ async function notifyHumans(text) {
  * - PAUSA o chat por HANDOFF_MINUTES (para o bot não ficar atrapalhando)
  * - NÃO cria card no Trello
  */
-async function handoffToHuman({ state, remoteJid, reason, incomingText, customClientMsg }) {
+async function handoffToHuman({ state, remoteJid, reason, incomingText, customClientMsg, skipClientMsg }) {
   const from = remoteJid.split("@")[0];
 
   // 1. Mensagem pro cliente (template Notion ou fallback, ou customizada)
-  const clientMsg = customClientMsg || await getTemplate(
-    "HANDOFF_CLIENTE",
-    "Entendi. Só um instante que vou chamar um atendente pra te ajudar direitinho por aqui. 🙏"
-  ).catch(() => "Entendi. Só um instante que vou chamar um atendente pra te ajudar direitinho por aqui. 🙏");
-  await waSendText({ remoteJid, text: clientMsg });
+  if (!skipClientMsg) {
+    const clientMsg = customClientMsg || await getTemplate(
+      "HANDOFF_CLIENTE",
+      "Entendi. Só um instante que vou chamar um atendente pra te ajudar direitinho por aqui. 🙏"
+    ).catch(() => "Entendi. Só um instante que vou chamar um atendente pra te ajudar direitinho por aqui. 🙏");
+    await waSendText({ remoteJid, text: clientMsg });
+  }
 
   // 2. Alert formatado para o atendente
   const alert = [
@@ -1042,15 +1044,15 @@ Conteúdo:
 - Responda APENAS o que o cliente perguntou. Seja direto.
 - NÃO mencione promoções, descontos ou ofertas proativamente. Só fale de promoções se o cliente perguntar explicitamente sobre desconto ou promoção.
 - CARDÁPIO: O restaurante NÃO tem "barca" — o nome correto é "combinado". Se o cliente perguntar sobre barca, corrija gentilmente dizendo que trabalhamos com combinados.
-- RODÍZIO TRADICIONAL vs PREMIUM: O rodízio TRADICIONAL inclui apenas as peças básicas (sushis, sashimis e temakis básicos do cardápio padrão). NÃO inclui todos os temakis — apenas os temakis básicos. O rodízio PREMIUM inclui opções premium e variedades maiores. Se o cliente perguntar se pode pedir "todos os temakis" no tradicional, diga que o tradicional tem apenas os temakis básicos do cardápio padrão — para os temakis especiais/premium é necessário o rodízio premium. Se não houver informação detalhada nos trechos do Notion, diga que não tem essa informação e que o cliente pode digitar *atendente* para falar diretamente com alguém da equipe.
+- RODÍZIO TRADICIONAL vs PREMIUM: O rodízio TRADICIONAL inclui apenas as peças básicas (sushis, sashimis e temakis básicos do cardápio padrão). NÃO inclui todos os temakis — apenas os temakis básicos. O rodízio PREMIUM inclui opções premium e variedades maiores. Se o cliente perguntar se pode pedir "todos os temakis" no tradicional, diga que o tradicional tem apenas os temakis básicos do cardápio padrão — para os temakis especiais/premium é necessário o rodízio premium. Se não houver informação detalhada nos trechos do Notion, diga que não tem essa informação e que vou chamar uma atendente para te ajudar! 🙏.
 - PROMOÇÕES DO GRUPO TSULOVERS: Se o cliente mencionar uma promoção do grupo de WhatsApp Tsulovers, responda sobre ESSA promoção específica (use os trechos do Notion). NUNCA confunda com a promoção de aniversário.
-- ANIVERSÁRIO: NUNCA mencione a promoção/política de aniversário de forma proativa. Só fale sobre aniversário se o cliente mencionar explicitamente a palavra "aniversário", "aniversariante" ou "comemoração de aniversário". Quando falar sobre aniversário, use APENAS as informações literalmente descritas nos trechos do Notion — NUNCA infira, complete ou extrapole detalhes que não estão escritos. Se o cliente perguntar algo específico sobre aniversário que não consta nos trechos (ex: qual tipo de rodízio o aniversariante ganha), diga que não tem essa informação no momento e que o cliente pode digitar *atendente* para falar diretamente com alguém da equipe.
+- ANIVERSÁRIO: NUNCA mencione a promoção/política de aniversário de forma proativa. Só fale sobre aniversário se o cliente mencionar explicitamente a palavra "aniversário", "aniversariante" ou "comemoração de aniversário". Quando falar sobre aniversário, use APENAS as informações literalmente descritas nos trechos do Notion — NUNCA infira, complete ou extrapole detalhes que não estão escritos. Se o cliente perguntar algo específico sobre aniversário que não consta nos trechos (ex: qual tipo de rodízio o aniversariante ganha), diga que não tem essa informação no momento e que vou chamar uma atendente para te ajudar! 🙏.
 - NÃO envie links a menos que o cliente peça link.
 - HORÁRIOS: O restaurante funciona de segunda a sábado, das 18:30 às 23h. NUNCA diga "18h" ou "18:00" — o horário correto de abertura é 18:30 (dezoito e meia), sem exceção. DOMINGOS: o restaurante está FECHADO aos domingos.
 - PREÇOS: Se os preços estiverem nos trechos do Notion, informe-os normalmente. NUNCA invente ou estime valores que não estejam nos trechos. Se não houver nenhum trecho com preço, diga que não tem essa informação no momento. IMPORTANTE: o preço do rodízio é FIXO e não muda por data — se o cliente perguntar o valor "para o dia X" ou "para a data Y", responda com o preço padrão do Notion (não existe preço especial por data, a menos que haja uma promoção explícita nos trechos).
 - RESERVAS: reserva é OPCIONAL (o cliente pode vir sem reserva por ordem de chegada). Se o cliente perguntar se precisa reservar, como reservar, onde reservar ou qualquer coisa sobre reservas, diga que é opcional e que se quiser pode reservar pelo site https://tsunagari-site.vercel.app. Nunca instrua o cliente a enviar dados de reserva pelo WhatsApp.
 - Não invente informações; use apenas os trechos fornecidos.
-- Se não tiver a informação que o cliente precisa, diga que não tem essa informação no momento e oriente: "você pode digitar *atendente* para falar com alguém da equipe".
+- Se não tiver a informação que o cliente precisa, diga: "Não tenho essa informação no momento, mas vou chamar uma atendente para te ajudar! 🙏"
 - Se faltou informação para completar uma ação (ex: data/hora de reserva), faça uma pergunta curta e objetiva.
 Formato:
 - 1 a 3 linhas curtas, estilo WhatsApp.
@@ -2170,6 +2172,12 @@ async function handleWebhook(bodyJson) {
   }
 
   await waSendText({ remoteJid, text: answer });
+
+  // Auto-handoff: se o bot disse que vai chamar atendente, dispara handoff sem reenviar msg ao cliente
+  if (/vou chamar (um |uma |o |a )?atendente/i.test(answer)) {
+    await handoffToHuman({ state, remoteJid, reason: "Bot sem resposta — chamou atendente automaticamente", incomingText, skipClientMsg: true });
+    return;
+  }
 
   // Salva histórico (máx. 4 pares = 8 mensagens)
   faqConv.history = [
