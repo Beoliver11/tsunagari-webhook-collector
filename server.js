@@ -24,11 +24,10 @@ const {
   OPENAI_API_KEY,
   OPENAI_MODEL = "gpt-4o",
 
-  // Evolution
-  EVOLUTION_SERVER_URL,
-  EVOLUTION_APIKEY,
-  EVOLUTION_INSTANCE = "n8n Tsunagari",
-  EVOLUTION_SEND_PATH = "/message/sendText",
+  // WhatsApp Cloud API
+  WA_TOKEN,
+  WA_PHONE_NUMBER_ID,
+  WA_VERIFY_TOKEN = "tsunagari_webhook_2026",
 
   // Alerts / humans
   ADMIN_WHATSAPP = "",
@@ -693,57 +692,74 @@ function getActiveRuleForMessage(text) {
   return null;
 }
 
-// ===== Evolution send =====
-async function evolutionSendText({ remoteJid, text }) {
-  const number = (remoteJid || "").split("@")[0];
-  const url =
-    EVOLUTION_SERVER_URL.replace(/\/$/, "") +
-    EVOLUTION_SEND_PATH +
-    "/" +
-    encodeURIComponent(EVOLUTION_INSTANCE);
-
+// ===== WhatsApp Cloud API send =====
+async function waSendText({ remoteJid, text }) {
+  const to = (remoteJid || "").split("@")[0];
+  const url = `https://graph.facebook.com/v21.0/${WA_PHONE_NUMBER_ID}/messages`;
   const r = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json", apikey: EVOLUTION_APIKEY },
-    body: JSON.stringify({ number, text }),
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${WA_TOKEN}` },
+    body: JSON.stringify({ messaging_product: "whatsapp", to, type: "text", text: { body: text } }),
   });
   const body = await r.text();
-  if (!r.ok) throw new Error(`Evolution send failed ${r.status}: ${body}`);
+  if (!r.ok) throw new Error(`WA send failed ${r.status}: ${body}`);
   return body;
 }
 
-async function evolutionSendTyping({ remoteJid, durationMs = 1500 }) {
-  const number = (remoteJid || "").split("@")[0];
-  const url =
-    EVOLUTION_SERVER_URL.replace(/\/$/, "") +
-    "/chat/sendPresence/" +
-    encodeURIComponent(EVOLUTION_INSTANCE);
-  try {
-    await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", apikey: EVOLUTION_APIKEY },
-      body: JSON.stringify({ number, presence: "composing", delay: durationMs }),
-    });
-    await new Promise((r) => setTimeout(r, Math.min(durationMs, 2500)));
-  } catch {
-    // typing indicator é best-effort; ignora erros
-  }
+async function waSendTyping({ remoteJid, durationMs = 1500 }) {
+  // Cloud API não suporta "composing" indicator — só delay
+  await new Promise((r) => setTimeout(r, Math.min(durationMs, 2500)));
 }
 
-// Baixa mídia (imagem/áudio) da Evolution API como base64
-async function evolutionGetMediaBase64(bodyJson) {
-  const url =
-    EVOLUTION_SERVER_URL.replace(/\/$/, "") +
-    "/chat/getBase64FromMediaMessage/" +
-    encodeURIComponent(EVOLUTION_INSTANCE);
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", apikey: EVOLUTION_APIKEY },
-    body: JSON.stringify({ message: bodyJson.data, convertToMp4: false }),
+// Baixa mídia da Cloud API pelo mediaId
+async function waGetMedia(mediaId) {
+  if (!mediaId) return { base64: null, mimetype: "application/octet-stream" };
+  const urlResp = await fetch(`https://graph.facebook.com/v21.0/${mediaId}`, {
+    headers: { Authorization: `Bearer ${WA_TOKEN}` },
   });
-  if (!r.ok) throw new Error(`Evolution media download failed ${r.status}`);
-  const j = await r.json();
-  return { base64: j.base64 || null, mimetype: j.mimetype || "application/octet-stream" };
+  if (!urlResp.ok) throw new Error(`WA media URL failed ${urlResp.status}`);
+  const urlData = await urlResp.json();
+  const mediaResp = await fetch(urlData.url, {
+    headers: { Authorization: `Bearer ${WA_TOKEN}` },
+  });
+  if (!mediaResp.ok) throw new Error(`WA media download failed ${mediaResp.status}`);
+  const buffer = await mediaResp.arrayBuffer();
+  return { base64: Buffer.from(buffer).toString("base64"), mimetype: urlData.mime_type || "application/octet-stream" };
+}
+
+// Normaliza payload da Cloud API para formato interno (Evolution-like)
+function normalizeCloudApiPayload(bodyJson) {
+  if (bodyJson?.object !== "whatsapp_business_account") return bodyJson;
+  const change = bodyJson?.entry?.[0]?.changes?.[0]?.value;
+  if (!change) return null;
+  if (change.statuses && !change.messages) return null; // delivery receipt — ignora
+  const msg = change.messages?.[0];
+  if (!msg) return null;
+  const remoteJid = `${msg.from}@s.whatsapp.net`;
+  let message = {};
+  let mediaId = null;
+  if (msg.type === "text") {
+    message.conversation = msg.text?.body || "";
+  } else if (msg.type === "image") {
+    mediaId = msg.image?.id;
+    message.imageMessage = { caption: msg.image?.caption || "", id: mediaId, mimetype: msg.image?.mime_type };
+  } else if (msg.type === "audio") {
+    mediaId = msg.audio?.id;
+    message.audioMessage = { id: mediaId, mimetype: msg.audio?.mime_type };
+  } else if (msg.type === "video") {
+    mediaId = msg.video?.id;
+    message.videoMessage = { caption: msg.video?.caption || "", id: mediaId, mimetype: msg.video?.mime_type };
+  } else if (msg.type === "sticker") {
+    mediaId = msg.sticker?.id;
+    message.stickerMessage = { id: mediaId };
+  } else if (msg.type === "document") {
+    mediaId = msg.document?.id;
+    message.documentMessage = { id: mediaId };
+  }
+  return {
+    event: "messages.upsert",
+    data: { key: { remoteJid, fromMe: false, id: msg.id }, messageId: msg.id, message, _waMediaId: mediaId },
+  };
 }
 
 // Descreve imagem com GPT-4o Vision
@@ -795,7 +811,7 @@ async function openaiTranscribeAudio(base64, mimetype = "audio/ogg") {
 async function notifyAdmin(text) {
   if (!ADMIN_WHATSAPP) return;
   try {
-    await evolutionSendText({ remoteJid: `${ADMIN_WHATSAPP}@s.whatsapp.net`, text });
+    await waSendText({ remoteJid: `${ADMIN_WHATSAPP}@s.whatsapp.net`, text });
   } catch (e) {
     console.error(`[${nowIso()}] admin_notify_failed`, e?.message || e);
   }
@@ -813,7 +829,7 @@ async function notifyHumans(text) {
   if (!nums.length) return;
   for (const num of nums) {
     try {
-      await evolutionSendText({ remoteJid: `${num}@s.whatsapp.net`, text });
+      await waSendText({ remoteJid: `${num}@s.whatsapp.net`, text });
     } catch (e) {
       console.error(`[${nowIso()}] human_notify_failed num=${num}`, e?.message || e);
     }
@@ -835,7 +851,7 @@ async function handoffToHuman({ state, remoteJid, reason, incomingText, customCl
     "HANDOFF_CLIENTE",
     "Entendi. Só um instante que vou chamar um atendente pra te ajudar direitinho por aqui. 🙏"
   ).catch(() => "Entendi. Só um instante que vou chamar um atendente pra te ajudar direitinho por aqui. 🙏");
-  await evolutionSendText({ remoteJid, text: clientMsg });
+  await waSendText({ remoteJid, text: clientMsg });
 
   // 2. Alert formatado para o atendente
   const alert = [
@@ -1476,31 +1492,20 @@ function markMissingAsked(state, remoteJid, conv, missingArr) {
 async function handleWebhook(bodyJson) {
   must("OPENAI_API_KEY", OPENAI_API_KEY);
   must("NOTION_TOKEN", NOTION_TOKEN);
-  must("EVOLUTION_SERVER_URL", EVOLUTION_SERVER_URL);
-  must("EVOLUTION_APIKEY", EVOLUTION_APIKEY);
+  must("WA_TOKEN", WA_TOKEN);
+  must("WA_PHONE_NUMBER_ID", WA_PHONE_NUMBER_ID);
   must("TRELLO_KEY", TRELLO_KEY);
   must("TRELLO_TOKEN", TRELLO_TOKEN);
   must("TRELLO_BOARD_ID", TRELLO_BOARD_ID);
+
+  // Normaliza payload da Cloud API para formato interno
+  bodyJson = normalizeCloudApiPayload(bodyJson) || bodyJson;
 
   const event = String(bodyJson.event || "").toLowerCase();
   if (event !== "messages.upsert") return;
 
   const remoteJid = bodyJson?.data?.key?.remoteJid;
   if (!remoteJid) return;
-
-  // Handoff automático: humano falou
-  if (bodyJson?.data?.key?.fromMe) {
-    const state = loadState();
-    const mins = Math.max(5, Number(HANDOFF_MINUTES || 180));
-    const existingConv = getConv(state, remoteJid);
-    if (existingConv) {
-      existingConv.humanRepliedAt = Date.now(); // cancela o lembrete de 10min
-      setConv(state, remoteJid, existingConv);
-    }
-    setHandoffPause(state, remoteJid, mins);
-    console.log(`[${nowIso()}] handoff pause set jid=${remoteJid} mins=${mins}`);
-    return;
-  }
 
   const incomingText = extractIncomingText(bodyJson);
   const mediaType = !incomingText ? extractIncomingMediaType(bodyJson) : null;
@@ -1538,7 +1543,7 @@ async function handleWebhook(bodyJson) {
 
   // Mensagem só com emojis — responde com ❤️ gentil e encerra
   if (incomingText && isEmojiOnly(incomingText)) {
-    await evolutionSendText({ remoteJid, text: "❤️" });
+    await waSendText({ remoteJid, text: "❤️" });
     markBotReplied(state, remoteJid);
     return;
   }
@@ -1562,9 +1567,9 @@ async function handleWebhook(bodyJson) {
         const history = (ruleConv.history || []).slice(-6);
 
         const typingMs = Math.min(2000, 600 + activeRule.conteudo.length * 15);
-        await evolutionSendTyping({ remoteJid, durationMs: typingMs });
+        await waSendTyping({ remoteJid, durationMs: typingMs });
 
-        await evolutionSendText({ remoteJid, text: activeRule.conteudo });
+        await waSendText({ remoteJid, text: activeRule.conteudo });
 
         ruleConv.history = [
           ...history,
@@ -1584,7 +1589,7 @@ async function handleWebhook(bodyJson) {
       "OPTOUT_CONFIRMADO",
       "Tudo certo — não vou te enviar mensagens por aqui. Se quiser voltar, é só me chamar. 🙏"
     );
-    await evolutionSendText({ remoteJid, text: msg });
+    await waSendText({ remoteJid, text: msg });
     clearConv(state, remoteJid);
     markBotReplied(state, remoteJid);
     return;
@@ -1643,7 +1648,7 @@ async function handleWebhook(bodyJson) {
       // reserva só se for sobre HOJE (não bloqueia reservas futuras feitas num domingo)
       (looksLikeReservaIntent(incomingText) && /\bhoje\b/.test(normalizeText(incomingText)));
     if (isDomingoQuestion) {
-      await evolutionSendText({
+      await waSendText({
         remoteJid,
         text: "Hoje é domingo e a gente não abre 🙁\nFuncionamos de segunda a sábado, das 18:30 às 23h. Te esperamos na semana! 🍣✨",
       });
@@ -1662,8 +1667,8 @@ async function handleWebhook(bodyJson) {
     if (mediaType === "audio") {
       // Transcreve áudio com Whisper e processa como texto normal
       try {
-        await evolutionSendTyping({ remoteJid, durationMs: 1200 });
-        const { base64, mimetype } = await evolutionGetMediaBase64(bodyJson);
+        await waSendTyping({ remoteJid, durationMs: 1200 });
+        const { base64, mimetype } = await waGetMedia(bodyJson.data._waMediaId);
         if (base64) {
           const transcription = await openaiTranscribeAudio(base64, mimetype);
           if (transcription && transcription.length > 2) {
@@ -1678,7 +1683,7 @@ async function handleWebhook(bodyJson) {
         console.error(`[${nowIso()}] whisper_error`, e?.message || e);
       }
       // fallback se transcrição falhar
-      await evolutionSendText({ remoteJid, text: "Recebi o áudio! Me escreve o que precisa que te ajudo 😊" });
+      await waSendText({ remoteJid, text: "Recebi o áudio! Me escreve o que precisa que te ajudo 😊" });
       markBotReplied(state, remoteJid);
       return;
     }
@@ -1686,8 +1691,8 @@ async function handleWebhook(bodyJson) {
     if (mediaType === "image") {
       // Descreve imagem com Vision e pede o que o cliente precisa
       try {
-        await evolutionSendTyping({ remoteJid, durationMs: 1500 });
-        const { base64, mimetype } = await evolutionGetMediaBase64(bodyJson);
+        await waSendTyping({ remoteJid, durationMs: 1500 });
+        const { base64, mimetype } = await waGetMedia(bodyJson.data._waMediaId);
         if (base64) {
           const description = await openaiDescribeImage(base64, mimetype);
           if (description) {
@@ -1697,7 +1702,7 @@ async function handleWebhook(bodyJson) {
             const retrieved = simpleRetrieve(description, KNOWLEDGE, 8);
             const answer = await openaiAnswer({ question: description, retrieved, history }).catch(() => null);
             if (answer) {
-              await evolutionSendText({ remoteJid, text: answer });
+              await waSendText({ remoteJid, text: answer });
               faqConv.history = [...history, { role: "user", content: `[imagem] ${description}` }, { role: "assistant", content: answer }].slice(-8);
               setConv(state, remoteJid, faqConv);
               markBotReplied(state, remoteJid);
@@ -1709,15 +1714,15 @@ async function handleWebhook(bodyJson) {
         console.error(`[${nowIso()}] vision_error`, e?.message || e);
       }
       // fallback
-      await evolutionSendText({ remoteJid, text: "Recebi a foto! Me escreve o que precisa que te ajudo 😊" });
+      await waSendText({ remoteJid, text: "Recebi a foto! Me escreve o que precisa que te ajudo 😊" });
       markBotReplied(state, remoteJid);
       return;
     }
 
     // sticker, documento, vídeo sem legenda
     const mediaMsg = await getTemplate("MEDIA_SEM_TEXTO", "Recebi! Me escreve o que precisa que te ajudo 😊");
-    await evolutionSendTyping({ remoteJid, durationMs: 800 });
-    await evolutionSendText({ remoteJid, text: mediaMsg });
+    await waSendTyping({ remoteJid, durationMs: 800 });
+    await waSendText({ remoteJid, text: mediaMsg });
     markBotReplied(state, remoteJid);
     return;
   }
@@ -1729,7 +1734,7 @@ async function handleWebhook(bodyJson) {
 
   // "Abre hoje?"
   if (looksLikeOpenTodayQuestion(incomingText)) {
-    await evolutionSendText({
+    await waSendText({
       remoteJid,
       text: "Sim, abrimos hoje! Das 18:30 às 23h 🍣✨",
     });
@@ -1753,7 +1758,7 @@ async function handleWebhook(bodyJson) {
       });
     }
 
-    await evolutionSendText({
+    await waSendText({
       remoteJid,
       text: welcome || "Oieeee❤️ Aqui é a Liz! Assistente do Tsunagari. Conte comigo!",
     });
@@ -1763,7 +1768,7 @@ async function handleWebhook(bodyJson) {
 
   // Non-japanese foods
   if (asksNonJapaneseFood(incomingText)) {
-    await evolutionSendText({
+    await waSendText({
       remoteJid,
       text: "A gente é um restaurante japonês 🍣✨ Então não trabalhamos com pizza/hambúrguer. Quer que eu te mande nosso cardápio ou te explico as opções?",
     });
@@ -1784,7 +1789,7 @@ async function handleWebhook(bodyJson) {
 
   // Reserva já confirmada pelo cliente — só acknowledges
   if (looksLikeReservaJaFeita(incomingText)) {
-    await evolutionSendText({
+    await waSendText({
       remoteJid,
       text: "Que ótimo! Te esperamos 🍣✨ Qualquer dúvida é só chamar!",
     });
@@ -1802,7 +1807,7 @@ async function handleWebhook(bodyJson) {
       // Pessoa quer reservar → só o link
       : "Faça sua reserva pelo nosso site! 🍣\nAcesse: https://tsunagari-site.vercel.app";
 
-    await evolutionSendText({ remoteJid, text: reservaText });
+    await waSendText({ remoteJid, text: reservaText });
     markBotReplied(state, remoteJid);
     return;
 
@@ -1879,7 +1884,7 @@ async function handleWebhook(bodyJson) {
     // date validations
     if (conv.data.dateObj) {
       if (FECHADO_DOMINGO !== "0" && isSundayBR(conv.data.dateObj)) {
-        await evolutionSendText({
+        await waSendText({
           remoteJid,
           text: "A gente não abre aos domingos 🙂 Quer reservar pra outro dia? Funcionamos de segunda a sábado, 18:30 às 23h. 🍣",
         });
@@ -1888,7 +1893,7 @@ async function handleWebhook(bodyJson) {
         return;
       }
       if (isPastDateBR(conv.data.dateObj)) {
-        await evolutionSendText({
+        await waSendText({
           remoteJid,
           text: "Essa data já passou 🙂 Consegue me confirmar a data da reserva (DD/MM)?",
         });
@@ -1898,7 +1903,7 @@ async function handleWebhook(bodyJson) {
       const maxDays = Math.max(7, Number(MAX_ADVANCE_DAYS || 120));
       const delta = daysFromTodayBR(conv.data.dateObj);
       if (delta > maxDays) {
-        await evolutionSendText({
+        await waSendText({
           remoteJid,
           text: `Consigo te ajudar sim 😊 Só me confirma uma data mais próxima (até ${maxDays} dias).`,
         });
@@ -1923,12 +1928,12 @@ async function handleWebhook(bodyJson) {
       );
 
       if (inReservaFlow) {
-        await evolutionSendText({
+        await waSendText({
           remoteJid,
           text: `Para completar sua reserva só me confirma rapidinho 😊\n${missing.map((m) => `- ${m}`).join("\n")}`,
         });
       } else {
-        await evolutionSendText({ remoteJid, text: pedir });
+        await waSendText({ remoteJid, text: pedir });
       }
 
       markMissingAsked(state, remoteJid, conv, missing);
@@ -1944,7 +1949,7 @@ async function handleWebhook(bodyJson) {
       );
       conv.awaitingHoraMaxConfirm = true;
       setConv(state, remoteJid, conv);
-      await evolutionSendText({ remoteJid, text: msg });
+      await waSendText({ remoteJid, text: msg });
       markBotReplied(state, remoteJid);
       return;
     }
@@ -1993,7 +1998,7 @@ async function handleWebhook(bodyJson) {
         "RESERVA_SEM_VAGAS",
         "❗ Já atingimos o limite de reservas para esse dia. Você pode vir sem reserva, por ordem de chegada. 😊"
       );
-      await evolutionSendText({ remoteJid, text: msg });
+      await waSendText({ remoteJid, text: msg });
       clearConv(state, remoteJid);
       markBotReplied(state, remoteJid);
       return;
@@ -2001,7 +2006,7 @@ async function handleWebhook(bodyJson) {
 
     // Limite 2 pessoas
     if (n === 2 && counts.twoP >= Number(RESERVA_MAX_2P_DIA)) {
-      await evolutionSendText({
+      await waSendText({
         remoteJid,
         text: "Hoje já atingimos o limite de reservas para 2 pessoas. 😊 Mas você pode vir sem reserva por ordem de chegada. 🍣✨",
       });
@@ -2026,7 +2031,7 @@ async function handleWebhook(bodyJson) {
         "RESERVA_SEM_VAGAS",
         "❗ Já atingimos o limite de reservas para esse dia. Você pode vir sem reserva, por ordem de chegada. 😊"
       );
-      await evolutionSendText({ remoteJid, text: msg });
+      await waSendText({ remoteJid, text: msg });
       clearConv(state, remoteJid);
       markBotReplied(state, remoteJid);
       return;
@@ -2052,7 +2057,7 @@ async function handleWebhook(bodyJson) {
       pessoasTotal: conv.data.pessoasTotal,
     });
 
-    await evolutionSendText({ remoteJid, text: confirmMsg });
+    await waSendText({ remoteJid, text: confirmMsg });
 
     clearConv(state, remoteJid);
     markBotReplied(state, remoteJid);
@@ -2078,7 +2083,7 @@ async function handleWebhook(bodyJson) {
 
   // Typing enquanto OpenAI processa
   const typingMs = Math.min(3000, 800 + incomingText.length * 20);
-  await evolutionSendTyping({ remoteJid, durationMs: typingMs });
+  await waSendTyping({ remoteJid, durationMs: typingMs });
 
   let answer;
   try {
@@ -2091,7 +2096,7 @@ async function handleWebhook(bodyJson) {
     ).catch(() => "Tive uma dificuldade aqui! Me manda sua pergunta novamente ou aguarda um instante. 🙏");
   }
 
-  await evolutionSendText({ remoteJid, text: answer });
+  await waSendText({ remoteJid, text: answer });
 
   // Salva histórico (máx. 4 pares = 8 mensagens)
   faqConv.history = [
@@ -2109,6 +2114,20 @@ async function handleWebhook(bodyJson) {
 
 // ===== HTTP server =====
 const server = http.createServer((req, res) => {
+  // WhatsApp Cloud API webhook verification
+  if (req.method === "GET" && req.url.startsWith("/webhook")) {
+    const qs = new URLSearchParams(req.url.includes("?") ? req.url.split("?")[1] : "");
+    if (
+      qs.get("hub.mode") === "subscribe" &&
+      qs.get("hub.verify_token") === (WA_VERIFY_TOKEN || "tsunagari_webhook_2026")
+    ) {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      return res.end(qs.get("hub.challenge") || "");
+    }
+    res.writeHead(403, { "Content-Type": "text/plain" });
+    return res.end("Forbidden");
+  }
+
   if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
     const payload = JSON.stringify({
       status: "ok",
@@ -2147,14 +2166,15 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    const normalizedForError = normalizeCloudApiPayload(bodyJson) || bodyJson;
     try {
       await handleWebhook(bodyJson);
     } catch (e) {
       const msg = e?.message || String(e);
       console.error(`[${nowIso()}] handler_error`, msg);
       try {
-        const remoteJid = bodyJson?.data?.key?.remoteJid || "";
-        const incomingText = extractIncomingText(bodyJson);
+        const remoteJid = normalizedForError?.data?.key?.remoteJid || "";
+        const incomingText = extractIncomingText(normalizedForError);
         await notifyAdmin(
           `🚨 ERRO no bot jid: ${remoteJid.split("@")[0] || "(?)"} msg: ${incomingText || "(sem texto)"} err: ${msg.slice(
             0,
@@ -2208,10 +2228,10 @@ const server = http.createServer((req, res) => {
         ].join("\n");
 
         for (const num of humanNums) {
-          await evolutionSendText({ remoteJid: `${num}@s.whatsapp.net`, text: reminder }).catch(() => {});
+          await waSendText({ remoteJid: `${num}@s.whatsapp.net`, text: reminder }).catch(() => {});
         }
         if (ADMIN_WHATSAPP && !humanNums.has(ADMIN_WHATSAPP)) {
-          await evolutionSendText({ remoteJid: `${ADMIN_WHATSAPP}@s.whatsapp.net`, text: reminder }).catch(() => {});
+          await waSendText({ remoteJid: `${ADMIN_WHATSAPP}@s.whatsapp.net`, text: reminder }).catch(() => {});
         }
 
         conv.handoffReminderSentAt = now;
