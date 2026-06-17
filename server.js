@@ -2240,6 +2240,12 @@ const server = http.createServer((req, res) => {
       // Pega telefone do contato da conversa
       const phone = (cwBody.conversation?.meta?.sender?.phone_number || "").replace(/\D/g, "");
       if (!phone) return;
+      // Pausa o bot para esse número (atendente entrou na conversa)
+      const remoteJid = `${phone}@s.whatsapp.net`;
+      const state = loadState();
+      const mins = Math.max(5, Number(HANDOFF_MINUTES || 180));
+      setHandoffPause(state, remoteJid, mins);
+      console.log(`[cw_reply] Atendente assumiu conversa com ${phone}, bot pausado ${mins}min`);
       // Envia via WhatsApp sem chamar chatwootSync (mensagem já está no Chatwoot)
       try {
         const waUrl = `https://graph.facebook.com/v21.0/${WA_PHONE_NUMBER_ID}/messages`;
