@@ -70,7 +70,100 @@ const {
   // Calendar rules
   FECHADO_DOMINGO = "1",
   MAX_ADVANCE_DAYS = "120",
+
+  // Painel de iniciar conversa
+  PANEL_TOKEN = "",         // senha para acessar /painel (opcional mas recomendado)
+  WA_TEMPLATE_NAME = "",    // nome do template aprovado no Meta (ex: tsunagari_ola)
 } = process.env;
+
+// ===== Painel HTML =====
+const PANEL_HTML = `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tsunagari — Iniciar Conversa</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.card{background:#fff;border-radius:16px;padding:32px;width:100%;max-width:420px;box-shadow:0 4px 24px rgba(0,0,0,.08)}
+h1{font-size:20px;color:#1a1a2e;margin-bottom:4px}
+.sub{font-size:13px;color:#666;margin-bottom:28px}
+label{display:block;font-size:13px;font-weight:600;color:#444;margin-bottom:6px}
+input,textarea{width:100%;border:1.5px solid #e0e0e0;border-radius:10px;padding:12px 14px;font-size:15px;outline:none;transition:border-color .2s;resize:none}
+input:focus,textarea:focus{border-color:#25d366}
+.field{margin-bottom:20px}
+.toggle{display:flex;gap:8px;margin-bottom:20px}
+.tb{flex:1;padding:10px;border:1.5px solid #e0e0e0;border-radius:10px;background:#fff;font-size:13px;cursor:pointer;color:#444;transition:all .2s}
+.tb.active{border-color:#25d366;background:#f0fdf4;color:#15803d;font-weight:600}
+.btn{width:100%;padding:14px;border:none;border-radius:12px;background:#25d366;color:#fff;font-size:16px;font-weight:600;cursor:pointer;transition:background .2s}
+.btn:hover{background:#1ebe5d}
+.btn:disabled{background:#ccc;cursor:not-allowed}
+.status{margin-top:16px;padding:12px 16px;border-radius:10px;font-size:14px;display:none}
+.ok{background:#f0fdf4;color:#15803d;border:1px solid #bbf7d0}
+.err{background:#fef2f2;color:#dc2626;border:1px solid #fecaca}
+.note{font-size:12px;color:#888;line-height:1.5;margin-bottom:16px;display:none;padding:10px 14px;background:#fffbeb;border:1px solid #fde68a;border-radius:10px}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🍣 Tsunagari</h1>
+  <p class="sub">Iniciar conversa com cliente</p>
+  <div class="field">
+    <label>Tipo de contato</label>
+    <div class="toggle">
+      <button class="tb active" id="b1" onclick="setMode('retomar')">Retomar conversa</button>
+      <button class="tb" id="b2" onclick="setMode('novo')">Número novo</button>
+    </div>
+  </div>
+  <div class="field">
+    <label for="phone">Número do cliente</label>
+    <input id="phone" type="tel" placeholder="61 99999-9999">
+  </div>
+  <div class="field" id="fmsg">
+    <label for="msg">Mensagem</label>
+    <textarea id="msg" rows="4" placeholder="Digite a mensagem..."></textarea>
+  </div>
+  <div class="note" id="note">
+    ⚡ Será enviada a mensagem de template aprovada pelo WhatsApp.<br>Use apenas para números que ainda não conversaram com o restaurante.
+  </div>
+  <button class="btn" onclick="enviar()">Enviar</button>
+  <div class="status" id="st"></div>
+</div>
+<script>
+let mode='retomar';
+const token=new URLSearchParams(location.search).get('token')||'';
+function setMode(m){
+  mode=m;
+  document.getElementById('b1').classList.toggle('active',m==='retomar');
+  document.getElementById('b2').classList.toggle('active',m==='novo');
+  document.getElementById('fmsg').style.display=m==='retomar'?'':'none';
+  document.getElementById('note').style.display=m==='novo'?'':'none';
+}
+async function enviar(){
+  const phone=document.getElementById('phone').value.trim();
+  const msg=document.getElementById('msg').value.trim();
+  const btn=document.querySelector('.btn');
+  if(!phone){show('Informe o número do cliente',false);return;}
+  if(mode==='retomar'&&!msg){show('Digite uma mensagem',false);return;}
+  btn.disabled=true;btn.textContent='Enviando...';
+  try{
+    const r=await fetch('/api/iniciar',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({phone,message:msg,useTemplate:mode==='novo',token})});
+    const d=await r.json();
+    if(d.ok){show('✓ Mensagem enviada!',true);document.getElementById('phone').value='';document.getElementById('msg').value='';}
+    else show('Erro: '+d.error,false);
+  }catch(e){show('Erro de rede: '+e.message,false);}
+  finally{btn.disabled=false;btn.textContent='Enviar';}
+}
+function show(msg,ok){
+  const el=document.getElementById('st');
+  el.textContent=msg;el.className='status '+(ok?'ok':'err');el.style.display='';
+  setTimeout(()=>el.style.display='none',5000);
+}
+</script>
+</body>
+</html>`;
 
 // ===== Mesas (regras internas) =====
 // Observação: a alocação é interna; o cliente não deve receber detalhes de "melhor lugar" etc.
@@ -2238,6 +2331,62 @@ const server = http.createServer((req, res) => {
     });
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
     return res.end(payload);
+  }
+
+  // ===== Painel de iniciar conversa =====
+  if (req.method === "GET" && req.url.startsWith("/painel")) {
+    const qs = new URLSearchParams(req.url.includes("?") ? req.url.split("?")[1] : "");
+    if (PANEL_TOKEN && qs.get("token") !== PANEL_TOKEN) {
+      res.writeHead(401, { "Content-Type": "text/plain" });
+      return res.end("Unauthorized — adicione ?token=PANEL_TOKEN na URL");
+    }
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    return res.end(PANEL_HTML);
+  }
+
+  if (req.method === "POST" && req.url === "/api/iniciar") {
+    let apiBuf = [];
+    req.on("data", (c) => apiBuf.push(c));
+    req.on("end", async () => {
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      let apiBody;
+      try { apiBody = JSON.parse(Buffer.concat(apiBuf).toString("utf8")); } catch { return res.end(JSON.stringify({ error: "JSON inválido" })); }
+      if (PANEL_TOKEN && apiBody.token !== PANEL_TOKEN) return res.end(JSON.stringify({ error: "Unauthorized" }));
+
+      let phone = (apiBody.phone || "").replace(/\D/g, "");
+      if (!phone) return res.end(JSON.stringify({ error: "Número inválido" }));
+      if (!phone.startsWith("55")) phone = "55" + phone;
+
+      const useTemplate = !!apiBody.useTemplate;
+      const message = (apiBody.message || "").trim();
+
+      try {
+        const waUrl = `https://graph.facebook.com/v21.0/${WA_PHONE_NUMBER_ID}/messages`;
+        const waHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${WA_TOKEN}` };
+        let waPayload;
+        if (useTemplate) {
+          if (!WA_TEMPLATE_NAME) return res.end(JSON.stringify({ error: "WA_TEMPLATE_NAME não configurado no EasyPanel" }));
+          waPayload = { messaging_product: "whatsapp", to: phone, type: "template",
+            template: { name: WA_TEMPLATE_NAME, language: { code: "pt_BR" } } };
+        } else {
+          if (!message) return res.end(JSON.stringify({ error: "Mensagem obrigatória" }));
+          waPayload = { messaging_product: "whatsapp", to: phone, type: "text", text: { body: message } };
+        }
+        const waR = await fetch(waUrl, { method: "POST", headers: waHeaders, body: JSON.stringify(waPayload) });
+        const waBody = await waR.text();
+        if (!waR.ok) return res.end(JSON.stringify({ error: `WA ${waR.status}: ${waBody}` }));
+
+        // Espelha no Chatwoot
+        const remoteJid = `${phone}@s.whatsapp.net`;
+        const sentText = useTemplate ? `[template: ${WA_TEMPLATE_NAME}]` : message;
+        chatwootSync(remoteJid, sentText, "outgoing").catch(() => {});
+
+        res.end(JSON.stringify({ ok: true, phone, mode: useTemplate ? "template" : "text" }));
+      } catch (e) {
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
   }
 
   // ===== Chatwoot reply webhook (Flavia → WhatsApp) =====
