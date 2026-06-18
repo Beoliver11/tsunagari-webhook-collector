@@ -703,8 +703,11 @@ const _cwCache = new Map();
 const CW_CACHE_TTL = 30 * 60 * 1000;
 // Rastreia mensagens enviadas pelo bot para evitar loop com webhook do Chatwoot
 const _cwBotSent = new Set();
+// Mapeia chatwoot_msg_id → wamid para suporte a quote-reply nativo
+const _cwWamidMap = new Map();
+const _CW_WAMID_MAX = 500;
 
-async function chatwootSync(remoteJid, text, direction) {
+async function chatwootSync(remoteJid, text, direction, wamid = null) {
   if (!CHATWOOT_URL || !CHATWOOT_TOKEN || !text) return;
   try {
     const phone = (remoteJid || "").split("@")[0].replace(/\D/g, "");
@@ -751,10 +754,19 @@ async function chatwootSync(remoteJid, text, direction) {
       _cwBotSent.add(k);
       setTimeout(() => _cwBotSent.delete(k), 15000);
     }
-    await fetch(`${base}/conversations/${cached.conversationId}/messages`, {
+    const msgPayload = { content: text, message_type: direction, private: false };
+    if (wamid) msgPayload.external_id = wamid;
+    const msgR = await fetch(`${base}/conversations/${cached.conversationId}/messages`, {
       method: "POST", headers: h,
-      body: JSON.stringify({ content: text, message_type: direction, private: false }),
+      body: JSON.stringify(msgPayload),
     });
+    if (wamid) {
+      const msgData = await msgR.json().catch(() => null);
+      if (msgData?.id) {
+        _cwWamidMap.set(msgData.id, wamid);
+        if (_cwWamidMap.size > _CW_WAMID_MAX) _cwWamidMap.delete(_cwWamidMap.keys().next().value);
+      }
+    }
   } catch (e) {
     console.error(`[chatwoot_sync] ${e?.message}`);
   }
@@ -771,7 +783,9 @@ async function waSendText({ remoteJid, text }) {
   });
   const body = await r.text();
   if (!r.ok) throw new Error(`WA send failed ${r.status}: ${body}`);
-  chatwootSync(remoteJid, text, "outgoing").catch(() => {});
+  let wamid = null;
+  try { wamid = JSON.parse(body)?.messages?.[0]?.id; } catch {}
+  chatwootSync(remoteJid, text, "outgoing", wamid).catch(() => {});
   return body;
 }
 
@@ -1583,8 +1597,11 @@ async function handleWebhook(bodyJson) {
   const mediaType = !incomingText ? extractIncomingMediaType(bodyJson) : null;
   if (!incomingText && !mediaType) return;
 
-  // Espelha mensagem recebida no Chatwoot
-  if (incomingText) chatwootSync(remoteJid, incomingText, "incoming").catch(() => {});
+  // Espelha mensagem recebida no Chatwoot (com wamid para quote-reply)
+  if (incomingText) {
+    const wamid = getIncomingMessageId(bodyJson);
+    chatwootSync(remoteJid, incomingText, "incoming", wamid).catch(() => {});
+  }
 
   // Lock por JID: evita race condition quando 2 mensagens chegam ao mesmo tempo
   if (PROCESSING_LOCK.has(remoteJid)) {
@@ -2233,10 +2250,13 @@ const server = http.createServer((req, res) => {
       if (!cwBody || cwBody.event !== "message_created") return;
       if (cwBody.message_type !== "outgoing") return;
       const content = cwBody.content;
-      if (!content || !content.trim()) return;
+      const attachments = cwBody.attachments || [];
+      if (!content?.trim() && attachments.length === 0) return;
       // Loop prevention: ignora mensagens que o próprio bot acabou de enviar
-      const k = content.slice(0, 80);
-      if (_cwBotSent.has(k)) { _cwBotSent.delete(k); return; }
+      if (content?.trim()) {
+        const k = content.slice(0, 80);
+        if (_cwBotSent.has(k)) { _cwBotSent.delete(k); return; }
+      }
       // Pega telefone do contato da conversa
       const phone = (cwBody.conversation?.meta?.sender?.phone_number || "").replace(/\D/g, "");
       if (!phone) return;
@@ -2246,16 +2266,43 @@ const server = http.createServer((req, res) => {
       const mins = Math.max(5, Number(HANDOFF_MINUTES || 180));
       setHandoffPause(state, remoteJid, mins);
       console.log(`[cw_reply] Atendente assumiu conversa com ${phone}, bot pausado ${mins}min`);
+      // Detecta quote-reply nativo do WhatsApp
+      const inReplyToId = cwBody.content_attributes?.in_reply_to;
+      const replyWamid = inReplyToId ? _cwWamidMap.get(inReplyToId) : null;
+      const waContext = replyWamid ? { context: { message_id: replyWamid } } : {};
       // Envia via WhatsApp sem chamar chatwootSync (mensagem já está no Chatwoot)
       try {
         const waUrl = `https://graph.facebook.com/v21.0/${WA_PHONE_NUMBER_ID}/messages`;
-        const r = await fetch(waUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${WA_TOKEN}` },
-          body: JSON.stringify({ messaging_product: "whatsapp", to: phone, type: "text", text: { body: content } }),
-        });
-        if (r.ok) console.log(`[cw_reply] Enviado "${content.slice(0, 40)}" → ${phone}`);
-        else console.error(`[cw_reply] WA erro ${r.status}: ${await r.text()}`);
+        const waHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${WA_TOKEN}` };
+        // Texto
+        if (content?.trim()) {
+          const r = await fetch(waUrl, {
+            method: "POST",
+            headers: waHeaders,
+            body: JSON.stringify({ messaging_product: "whatsapp", to: phone, type: "text", text: { body: content }, ...waContext }),
+          });
+          if (r.ok) console.log(`[cw_reply] Enviado "${content.slice(0, 40)}" → ${phone}${replyWamid ? " (quote-reply)" : ""}`);
+          else console.error(`[cw_reply] WA erro ${r.status}: ${await r.text()}`);
+        }
+        // Anexos (imagens, documentos, áudio)
+        for (const att of attachments) {
+          if (!att.data_url) continue;
+          let waPayload;
+          if (att.file_type === "image") {
+            waPayload = { type: "image", image: { link: att.data_url } };
+          } else if (att.file_type === "audio") {
+            waPayload = { type: "audio", audio: { link: att.data_url } };
+          } else {
+            waPayload = { type: "document", document: { link: att.data_url, filename: att.file_name || "arquivo" } };
+          }
+          const ar = await fetch(waUrl, {
+            method: "POST",
+            headers: waHeaders,
+            body: JSON.stringify({ messaging_product: "whatsapp", to: phone, ...waPayload }),
+          });
+          if (ar.ok) console.log(`[cw_reply] Anexo (${att.file_type}) → ${phone}`);
+          else console.error(`[cw_reply] WA anexo erro ${ar.status}: ${await ar.text()}`);
+        }
       } catch (e) {
         console.error(`[cw_reply] ${e.message}`);
       }
