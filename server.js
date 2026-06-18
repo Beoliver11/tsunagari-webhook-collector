@@ -82,57 +82,99 @@ const PANEL_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Tsunagari — Iniciar Conversa</title>
+<title>Tsunagari — Painel</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
-.card{background:#fff;border-radius:16px;padding:32px;width:100%;max-width:420px;box-shadow:0 4px 24px rgba(0,0,0,.08)}
-h1{font-size:20px;color:#1a1a2e;margin-bottom:4px}
-.sub{font-size:13px;color:#666;margin-bottom:28px}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;min-height:100vh;display:flex;align-items:flex-start;justify-content:center;padding:20px}
+.card{background:#fff;border-radius:16px;padding:28px;width:100%;max-width:440px;box-shadow:0 4px 24px rgba(0,0,0,.08);margin-top:20px}
+h1{font-size:20px;color:#1a1a2e;margin-bottom:20px}
+/* tabs */
+.tabs{display:flex;gap:4px;background:#f0f2f5;border-radius:10px;padding:4px;margin-bottom:24px}
+.tab{flex:1;padding:9px;border:none;border-radius:8px;background:transparent;font-size:13px;cursor:pointer;color:#666;transition:all .2s;font-weight:500}
+.tab.active{background:#fff;color:#1a1a2e;font-weight:600;box-shadow:0 1px 4px rgba(0,0,0,.1)}
+/* search */
+.search-wrap{position:relative;margin-bottom:12px}
+.search-wrap input{padding-left:40px}
+.search-icon{position:absolute;left:13px;top:50%;transform:translateY(-50%);font-size:16px;pointer-events:none}
+.results{border:1.5px solid #e0e0e0;border-radius:10px;overflow:hidden;display:none}
+.result-item{padding:12px 16px;cursor:pointer;transition:background .15s;border-bottom:1px solid #f0f0f0;display:flex;flex-direction:column;gap:2px}
+.result-item:last-child{border-bottom:none}
+.result-item:hover{background:#f9fafb}
+.result-name{font-size:14px;font-weight:600;color:#1a1a2e}
+.result-phone{font-size:13px;color:#666}
+.no-results{padding:16px;text-align:center;color:#999;font-size:13px}
+/* send form */
 label{display:block;font-size:13px;font-weight:600;color:#444;margin-bottom:6px}
 input,textarea{width:100%;border:1.5px solid #e0e0e0;border-radius:10px;padding:12px 14px;font-size:15px;outline:none;transition:border-color .2s;resize:none}
 input:focus,textarea:focus{border-color:#25d366}
-.field{margin-bottom:20px}
-.toggle{display:flex;gap:8px;margin-bottom:20px}
+.field{margin-bottom:18px}
+.toggle{display:flex;gap:8px;margin-bottom:18px}
 .tb{flex:1;padding:10px;border:1.5px solid #e0e0e0;border-radius:10px;background:#fff;font-size:13px;cursor:pointer;color:#444;transition:all .2s}
 .tb.active{border-color:#25d366;background:#f0fdf4;color:#15803d;font-weight:600}
-.btn{width:100%;padding:14px;border:none;border-radius:12px;background:#25d366;color:#fff;font-size:16px;font-weight:600;cursor:pointer;transition:background .2s}
+.btn{width:100%;padding:13px;border:none;border-radius:12px;background:#25d366;color:#fff;font-size:15px;font-weight:600;cursor:pointer;transition:background .2s}
 .btn:hover{background:#1ebe5d}
 .btn:disabled{background:#ccc;cursor:not-allowed}
-.status{margin-top:16px;padding:12px 16px;border-radius:10px;font-size:14px;display:none}
+.status{margin-top:14px;padding:11px 14px;border-radius:10px;font-size:13px;display:none}
 .ok{background:#f0fdf4;color:#15803d;border:1px solid #bbf7d0}
 .err{background:#fef2f2;color:#dc2626;border:1px solid #fecaca}
 .note{font-size:12px;color:#888;line-height:1.5;margin-bottom:16px;display:none;padding:10px 14px;background:#fffbeb;border:1px solid #fde68a;border-radius:10px}
+.pane{display:none}
+.pane.active{display:block}
 </style>
 </head>
 <body>
 <div class="card">
   <h1>🍣 Tsunagari</h1>
-  <p class="sub">Iniciar conversa com cliente</p>
-  <div class="field">
-    <label>Tipo de contato</label>
-    <div class="toggle">
-      <button class="tb active" id="b1" onclick="setMode('retomar')">Retomar conversa</button>
-      <button class="tb" id="b2" onclick="setMode('novo')">Número novo</button>
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('search')">🔍 Pesquisar</button>
+    <button class="tab" onclick="switchTab('send')">💬 Enviar mensagem</button>
+  </div>
+
+  <!-- Aba pesquisa -->
+  <div class="pane active" id="pane-search">
+    <div class="search-wrap">
+      <span class="search-icon">🔍</span>
+      <input id="sq" type="tel" placeholder="Digite parte do número… ex: 2070" oninput="buscar(this.value)">
     </div>
+    <div class="results" id="results"></div>
   </div>
-  <div class="field">
-    <label for="phone">Número do cliente</label>
-    <input id="phone" type="tel" placeholder="61 99999-9999">
+
+  <!-- Aba enviar -->
+  <div class="pane" id="pane-send">
+    <div class="field">
+      <label>Tipo de contato</label>
+      <div class="toggle">
+        <button class="tb active" id="b1" onclick="setMode('retomar')">Retomar conversa</button>
+        <button class="tb" id="b2" onclick="setMode('novo')">Número novo</button>
+      </div>
+    </div>
+    <div class="field">
+      <label for="phone">Número do cliente</label>
+      <input id="phone" type="tel" placeholder="61 99999-9999">
+    </div>
+    <div class="field" id="fmsg">
+      <label for="msg">Mensagem</label>
+      <textarea id="msg" rows="4" placeholder="Digite a mensagem..."></textarea>
+    </div>
+    <div class="note" id="note">
+      ⚡ Será enviada a mensagem de template aprovada pelo WhatsApp.<br>Use apenas para números que ainda não conversaram com o restaurante.
+    </div>
+    <button class="btn" onclick="enviar()">Enviar</button>
+    <div class="status" id="st"></div>
   </div>
-  <div class="field" id="fmsg">
-    <label for="msg">Mensagem</label>
-    <textarea id="msg" rows="4" placeholder="Digite a mensagem..."></textarea>
-  </div>
-  <div class="note" id="note">
-    ⚡ Será enviada a mensagem de template aprovada pelo WhatsApp.<br>Use apenas para números que ainda não conversaram com o restaurante.
-  </div>
-  <button class="btn" onclick="enviar()">Enviar</button>
-  <div class="status" id="st"></div>
 </div>
+
 <script>
-let mode='retomar';
 const token=new URLSearchParams(location.search).get('token')||'';
+let mode='retomar';
+let searchTimer=null;
+
+function switchTab(t){
+  document.querySelectorAll('.tab').forEach((el,i)=>el.classList.toggle('active',i===(t==='search'?0:1)));
+  document.getElementById('pane-search').classList.toggle('active',t==='search');
+  document.getElementById('pane-send').classList.toggle('active',t==='send');
+}
+
 function setMode(m){
   mode=m;
   document.getElementById('b1').classList.toggle('active',m==='retomar');
@@ -140,13 +182,41 @@ function setMode(m){
   document.getElementById('fmsg').style.display=m==='retomar'?'':'none';
   document.getElementById('note').style.display=m==='novo'?'':'none';
 }
+
+function buscar(q){
+  clearTimeout(searchTimer);
+  const box=document.getElementById('results');
+  if(q.trim().length<2){box.style.display='none';box.innerHTML='';return;}
+  searchTimer=setTimeout(async()=>{
+    box.style.display='block';
+    box.innerHTML='<div class="no-results">Buscando…</div>';
+    try{
+      const r=await fetch('/api/buscar?q='+encodeURIComponent(q)+'&token='+encodeURIComponent(token));
+      const d=await r.json();
+      if(!d.contacts||d.contacts.length===0){box.innerHTML='<div class="no-results">Nenhum contato encontrado</div>';return;}
+      box.innerHTML=d.contacts.map(c=>\`
+        <div class="result-item" onclick="selecionarContato('\${c.phone}','\${c.name.replace(/'/g,"\\\\'")}')">
+          <span class="result-name">\${c.name||'(sem nome)'}</span>
+          <span class="result-phone">\${c.phone}</span>
+        </div>\`).join('');
+    }catch(e){box.innerHTML='<div class="no-results">Erro ao buscar</div>';}
+  },350);
+}
+
+function selecionarContato(phone,name){
+  document.getElementById('phone').value=phone;
+  switchTab('send');
+  document.getElementById('sq').value='';
+  document.getElementById('results').style.display='none';
+}
+
 async function enviar(){
   const phone=document.getElementById('phone').value.trim();
   const msg=document.getElementById('msg').value.trim();
-  const btn=document.querySelector('.btn');
+  const btn=document.querySelector('#pane-send .btn');
   if(!phone){show('Informe o número do cliente',false);return;}
   if(mode==='retomar'&&!msg){show('Digite uma mensagem',false);return;}
-  btn.disabled=true;btn.textContent='Enviando...';
+  btn.disabled=true;btn.textContent='Enviando…';
   try{
     const r=await fetch('/api/iniciar',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({phone,message:msg,useTemplate:mode==='novo',token})});
@@ -156,6 +226,7 @@ async function enviar(){
   }catch(e){show('Erro de rede: '+e.message,false);}
   finally{btn.disabled=false;btn.textContent='Enviar';}
 }
+
 function show(msg,ok){
   const el=document.getElementById('st');
   el.textContent=msg;el.className='status '+(ok?'ok':'err');el.style.display='';
@@ -2342,6 +2413,34 @@ const server = http.createServer((req, res) => {
     }
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     return res.end(PANEL_HTML);
+  }
+
+  if (req.method === "GET" && req.url.startsWith("/api/buscar")) {
+    const qs = new URLSearchParams(req.url.includes("?") ? req.url.split("?")[1] : "");
+    if (PANEL_TOKEN && qs.get("token") !== PANEL_TOKEN) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "Unauthorized" }));
+    }
+    const q = (qs.get("q") || "").trim();
+    if (q.length < 2) {
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      return res.end(JSON.stringify({ contacts: [] }));
+    }
+    try {
+      const h = { "api_access_token": CHATWOOT_TOKEN };
+      const base = `${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}`;
+      const r = await fetch(`${base}/contacts/search?q=${encodeURIComponent(q)}&include_contacts=true&page=1`, { headers: h });
+      const data = await r.json();
+      const contacts = (data?.payload || [])
+        .map(c => ({ id: c.id, name: c.name || "", phone: c.phone_number || "" }))
+        .filter(c => c.phone);
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ contacts }));
+    } catch (e) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
   }
 
   if (req.method === "POST" && req.url === "/api/iniciar") {
