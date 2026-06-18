@@ -871,7 +871,7 @@ const _cwBotSent = new Set();
 const _cwWamidMap = new Map();
 const _CW_WAMID_MAX = 500;
 
-async function chatwootSync(remoteJid, text, direction, wamid = null) {
+async function chatwootSync(remoteJid, text, direction, wamid = null, contactName = null) {
   if (!CHATWOOT_URL || !CHATWOOT_TOKEN || !text) return;
   try {
     const phone = (remoteJid || "").split("@")[0].replace(/\D/g, "");
@@ -887,12 +887,19 @@ async function chatwootSync(remoteJid, text, direction, wamid = null) {
       const sr = await fetch(`${base}/contacts/search?q=${encodeURIComponent(`+${phone}`)}&include_contacts=true`, { headers: h });
       const sd = await sr.json();
       let contactId = sd?.payload?.[0]?.id;
+      const existingName = sd?.payload?.[0]?.name || "";
       if (!contactId) {
         const cr = await fetch(`${base}/contacts`, {
           method: "POST", headers: h,
-          body: JSON.stringify({ phone_number: `+${phone}`, name: phone }),
+          body: JSON.stringify({ phone_number: `+${phone}`, name: contactName || phone }),
         });
         contactId = (await cr.json())?.id;
+      } else if (contactName && existingName === phone) {
+        // atualiza nome se estava como número bruto
+        await fetch(`${base}/contacts/${contactId}`, {
+          method: "PATCH", headers: h,
+          body: JSON.stringify({ name: contactName }),
+        }).catch(() => {});
       }
       if (!contactId) return;
 
@@ -909,7 +916,15 @@ async function chatwootSync(remoteJid, text, direction, wamid = null) {
       }
       if (!conversationId) return;
 
-      cached = { contactId, conversationId, ts: Date.now() };
+      cached = { contactId, conversationId, ts: Date.now(), name: contactName || "" };
+      _cwCache.set(phone, cached);
+    } else if (contactName && cached.name !== contactName) {
+      // nome mudou (ex: cliente atualizou no WhatsApp) — atualiza no Chatwoot
+      await fetch(`${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/contacts/${cached.contactId}`, {
+        method: "PATCH", headers: h,
+        body: JSON.stringify({ name: contactName }),
+      }).catch(() => {});
+      cached.name = contactName;
       _cwCache.set(phone, cached);
     }
 
@@ -1005,7 +1020,10 @@ function normalizeCloudApiPayload(bodyJson) {
   }
   return {
     event: "messages.upsert",
-    data: { key: { remoteJid, fromMe: false, id: msg.id }, messageId: msg.id, message, _waMediaId: mediaId },
+    data: {
+      key: { remoteJid, fromMe: false, id: msg.id }, messageId: msg.id, message, _waMediaId: mediaId,
+      _waContactName: change.contacts?.[0]?.profile?.name || null,
+    },
   };
 }
 
@@ -1763,10 +1781,11 @@ async function handleWebhook(bodyJson) {
   const mediaType = !incomingText ? extractIncomingMediaType(bodyJson) : null;
   if (!incomingText && !mediaType) return;
 
-  // Espelha mensagem recebida no Chatwoot (com wamid para quote-reply)
+  // Espelha mensagem recebida no Chatwoot (com wamid e nome do contato)
   if (incomingText) {
     const wamid = getIncomingMessageId(bodyJson);
-    chatwootSync(remoteJid, incomingText, "incoming", wamid).catch(() => {});
+    const contactName = bodyJson?.data?._waContactName || null;
+    chatwootSync(remoteJid, incomingText, "incoming", wamid, contactName).catch(() => {});
   }
 
   // Lock por JID: evita race condition quando 2 mensagens chegam ao mesmo tempo
