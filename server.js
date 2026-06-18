@@ -2426,20 +2426,22 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       return res.end(JSON.stringify({ contacts: [] }));
     }
-    try {
-      const h = { "api_access_token": CHATWOOT_TOKEN };
-      const base = `${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}`;
-      const r = await fetch(`${base}/contacts/search?q=${encodeURIComponent(q)}&include_contacts=true&page=1`, { headers: h });
-      const data = await r.json();
-      const contacts = (data?.payload || [])
-        .map(c => ({ id: c.id, name: c.name || "", phone: c.phone_number || "" }))
-        .filter(c => c.phone);
-      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify({ contacts }));
-    } catch (e) {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: e.message }));
-    }
+    (async () => {
+      try {
+        const h = { "api_access_token": CHATWOOT_TOKEN };
+        const base = `${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}`;
+        const r = await fetch(`${base}/contacts/search?q=${encodeURIComponent(q)}&include_contacts=true&page=1`, { headers: h });
+        const data = await r.json();
+        const contacts = (data?.payload || [])
+          .map(c => ({ id: c.id, name: c.name || "", phone: c.phone_number || "" }))
+          .filter(c => c.phone);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ contacts }));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    })();
     return;
   }
 
