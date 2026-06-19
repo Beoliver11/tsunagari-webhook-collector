@@ -893,7 +893,7 @@ async function chatwootSync(remoteJid, text, direction, wamid = null, contactNam
           method: "POST", headers: h,
           body: JSON.stringify({ phone_number: `+${phone}`, name: contactName || phone }),
         });
-        contactId = (await cr.json())?.id;
+        contactId = (await cr.json())?.payload?.contact?.id;
       } else if (contactName && existingName === phone) {
         // atualiza nome se estava como número bruto
         await fetch(`${base}/contacts/${contactId}`, {
