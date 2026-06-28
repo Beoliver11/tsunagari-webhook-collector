@@ -11,8 +11,50 @@
  */
 
 const http = require("http");
+const https = require("https");
 const fs = require("fs");
 const path = require("path");
+
+// Conexões com a Meta (graph.facebook.com / CDN de mídia) ficam travando (ETIMEDOUT) com o
+// fetch padrão do Node nessa VPS — funciona só forçando IPv4 + TLS 1.3 explícitos.
+const _metaAgent = new https.Agent({
+  keepAlive: true,
+  family: 4,
+  minVersion: "TLSv1.3",
+  maxVersion: "TLSv1.3",
+});
+
+function metaFetch(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const req = https.request(
+      {
+        hostname: u.hostname,
+        path: u.pathname + (u.search || ""),
+        method: options.method || "GET",
+        headers: options.headers || {},
+        agent: _metaAgent,
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          const buf = Buffer.concat(chunks);
+          resolve({
+            ok: res.statusCode >= 200 && res.statusCode < 300,
+            status: res.statusCode,
+            text: async () => buf.toString("utf8"),
+            json: async () => JSON.parse(buf.toString("utf8")),
+            arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
+          });
+        });
+      }
+    );
+    req.on("error", reject);
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+}
 
 // Lock em memória: evita que duas mensagens do mesmo número sejam processadas
 // simultaneamente (race condition no state.json)
@@ -955,7 +997,7 @@ async function chatwootSync(remoteJid, text, direction, wamid = null, contactNam
 async function waSendText({ remoteJid, text }) {
   const to = (remoteJid || "").split("@")[0];
   const url = `https://graph.facebook.com/v21.0/${WA_PHONE_NUMBER_ID}/messages`;
-  const r = await fetch(url, {
+  const r = await metaFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${WA_TOKEN}` },
     body: JSON.stringify({ messaging_product: "whatsapp", to, type: "text", text: { body: text } }),
@@ -976,12 +1018,12 @@ async function waSendTyping({ remoteJid, durationMs = 1500 }) {
 // Baixa mídia da Cloud API pelo mediaId
 async function waGetMedia(mediaId) {
   if (!mediaId) return { base64: null, mimetype: "application/octet-stream" };
-  const urlResp = await fetch(`https://graph.facebook.com/v21.0/${mediaId}`, {
+  const urlResp = await metaFetch(`https://graph.facebook.com/v21.0/${mediaId}`, {
     headers: { Authorization: `Bearer ${WA_TOKEN}` },
   });
   if (!urlResp.ok) throw new Error(`WA media URL failed ${urlResp.status}`);
   const urlData = await urlResp.json();
-  const mediaResp = await fetch(urlData.url, {
+  const mediaResp = await metaFetch(urlData.url, {
     headers: { Authorization: `Bearer ${WA_TOKEN}` },
   });
   if (!mediaResp.ok) throw new Error(`WA media download failed ${mediaResp.status}`);
@@ -2492,7 +2534,7 @@ const server = http.createServer((req, res) => {
           if (!message) return res.end(JSON.stringify({ error: "Mensagem obrigatória" }));
           waPayload = { messaging_product: "whatsapp", to: phone, type: "text", text: { body: message } };
         }
-        const waR = await fetch(waUrl, { method: "POST", headers: waHeaders, body: JSON.stringify(waPayload) });
+        const waR = await metaFetch(waUrl, { method: "POST", headers: waHeaders, body: JSON.stringify(waPayload) });
         const waBody = await waR.text();
         if (!waR.ok) return res.end(JSON.stringify({ error: `WA ${waR.status}: ${waBody}` }));
 
@@ -2547,7 +2589,7 @@ const server = http.createServer((req, res) => {
         const waHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${WA_TOKEN}` };
         // Texto
         if (content?.trim()) {
-          const r = await fetch(waUrl, {
+          const r = await metaFetch(waUrl, {
             method: "POST",
             headers: waHeaders,
             body: JSON.stringify({ messaging_product: "whatsapp", to: phone, type: "text", text: { body: content }, ...waContext }),
@@ -2566,7 +2608,7 @@ const server = http.createServer((req, res) => {
           } else {
             waPayload = { type: "document", document: { link: att.data_url, filename: att.file_name || "arquivo" } };
           }
-          const ar = await fetch(waUrl, {
+          const ar = await metaFetch(waUrl, {
             method: "POST",
             headers: waHeaders,
             body: JSON.stringify({ messaging_product: "whatsapp", to: phone, ...waPayload }),
