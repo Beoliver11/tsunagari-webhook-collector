@@ -1291,6 +1291,7 @@ Conteúdo:
 - HORÁRIOS: O restaurante funciona de segunda a sábado, das 18:30 às 23h. NUNCA diga "18h" ou "18:00" — o horário correto de abertura é 18:30 (dezoito e meia), sem exceção. DOMINGOS: o restaurante está FECHADO aos domingos. Ao informar o horário, convide o cliente a vir até o restaurante — NUNCA mencione delivery/iFood nessa resposta.
 - PREÇOS: Se os preços estiverem nos trechos do Notion, informe-os normalmente. NUNCA invente ou estime valores que não estejam nos trechos. Se não houver nenhum trecho com preço, diga que não tem essa informação no momento. IMPORTANTE: o preço do rodízio é FIXO e não muda por data — se o cliente perguntar o valor "para o dia X" ou "para a data Y", responda com o preço padrão do Notion (não existe preço especial por data, a menos que haja uma promoção explícita nos trechos).
 - RESERVAS: reserva é OPCIONAL (o cliente pode vir sem reserva por ordem de chegada). Se o cliente perguntar se precisa reservar, como reservar, onde reservar ou qualquer coisa sobre reservas, diga que é opcional e que se quiser pode reservar pelo site https://tsunagari-site.vercel.app. Nunca instrua o cliente a enviar dados de reserva pelo WhatsApp.
+- DEPÓSITO/SINAL: NUNCA mencione proativamente se é necessário ou não fazer depósito/sinal — mesmo para grupos grandes. Só fale sobre depósito ou sinal se o cliente perguntar EXPLICITAMENTE sobre isso.
 - Não invente informações; use apenas os trechos fornecidos.
 - Se não tiver a informação que o cliente precisa, diga: "Não tenho essa informação no momento, mas vou chamar uma atendente para te ajudar! 🙏"
 - Se faltou informação para completar uma ação (ex: data/hora de reserva), faça uma pergunta curta e objetiva.
@@ -1853,6 +1854,15 @@ async function handleWebhook(bodyJson) {
   // paused?
   const existing = getConv(state, remoteJid);
   if (existing?.handoffUntil && existing.handoffUntil > Date.now()) return;
+
+  // Primeiro contato: se a mensagem já vem com pedido/pergunta junto (não é só um "oi"),
+  // a Liz se apresenta antes de responder o que foi pedido — pra pessoa saber que é uma assistente virtual.
+  if (!existing && incomingText && !looksLikeGreeting(incomingText)) {
+    await waSendText({
+      remoteJid,
+      text: "Oieee❤️ Aqui é a Liz! Assistente virtual do Tsunagari.",
+    });
+  }
 
   // Cancelamento de reserva — chama atendente antes do motor de regras
   if (incomingText && looksLikeCancelReserva(incomingText)) {
