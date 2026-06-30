@@ -351,7 +351,7 @@ function looksLikeOrderIntent(text) {
   const t = normalizeText(text);
   return (
     // intenção explícita de pedir/pedido (evita "pedir informações", "pedir o cardápio")
-    /\b(fazer um pedido|quero pedir|vou pedir|vou querer|meu pedido|numero do pedido)\b/.test(t) ||
+    /\b(fazer (um |o |meu )?pedido|quero pedir|queria pedir|gostaria de pedir|posso pedir|vou pedir|vou querer|meu pedido|numero do pedido|quero comprar|queria comprar|gostaria de comprar)\b/.test(t) ||
     // retirar em contexto de comida (todas as variações)
     /\b(retirar no local|retirar o pedido|buscar o pedido|quero retirar|posso retirar|fazer retirada|para retirar|vou retirar|retirada do pedido)\b/.test(t) ||
     // "retirada" sozinha (sem contexto de reserva) — ex: "tem retirada?", "aceita retirada"
@@ -1292,6 +1292,7 @@ Conteúdo:
 - PREÇOS: Se os preços estiverem nos trechos do Notion, informe-os normalmente. NUNCA invente ou estime valores que não estejam nos trechos. Se não houver nenhum trecho com preço, diga que não tem essa informação no momento. IMPORTANTE: o preço do rodízio é FIXO e não muda por data — se o cliente perguntar o valor "para o dia X" ou "para a data Y", responda com o preço padrão do Notion (não existe preço especial por data, a menos que haja uma promoção explícita nos trechos).
 - RESERVAS: reserva é OPCIONAL (o cliente pode vir sem reserva por ordem de chegada). Se o cliente perguntar se precisa reservar, como reservar, onde reservar ou qualquer coisa sobre reservas, diga que é opcional e que se quiser pode reservar pelo site https://tsunagari-site.vercel.app. Nunca instrua o cliente a enviar dados de reserva pelo WhatsApp.
 - DEPÓSITO/SINAL: NUNCA mencione proativamente se é necessário ou não fazer depósito/sinal — mesmo para grupos grandes. Só fale sobre depósito ou sinal se o cliente perguntar EXPLICITAMENTE sobre isso.
+- PEDIDO PARA RETIRADA/DELIVERY: Se o cliente disser que quer fazer/encomendar um pedido (para retirar ou receber em casa), NUNCA diga para ele vir pessoalmente fazer o pedido. Diga que vai chamar uma atendente para ajudar com o pedido. 🙏
 - Não invente informações; use apenas os trechos fornecidos.
 - Se não tiver a informação que o cliente precisa, diga: "Não tenho essa informação no momento, mas vou chamar uma atendente para te ajudar! 🙏"
 - Se faltou informação para completar uma ação (ex: data/hora de reserva), faça uma pergunta curta e objetiva.
