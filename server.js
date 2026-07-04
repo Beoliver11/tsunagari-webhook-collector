@@ -535,8 +535,8 @@ function looksLikeInsistence(text) {
 }
 
 function looksLikeFrustration(text) {
-  // Cliente mandou só "?", "??", "???" ou "!" — sinal claro de confusão/frustração
-  return /^[?!]{1,6}$/.test((text || "").trim());
+  // "??" ou mais = confusão/frustração. "?" sozinho é follow-up conversacional — tratado separadamente.
+  return /^[?!]{2,6}$/.test((text || "").trim());
 }
 
 function looksLikeDiaDoNamorados(text) {
@@ -1292,9 +1292,9 @@ Conteúdo:
 - CARDÁPIO: O restaurante NÃO tem "barca" — o nome correto é "combinado". Se o cliente perguntar sobre barca, corrija gentilmente dizendo que trabalhamos com combinados.
 - DELIVERY/ENTREGA: O restaurante FAZ entregas pelo iFood. Mas só mencione isso se o cliente perguntar EXPLICITAMENTE sobre entrega/delivery/iFood. NUNCA mencione delivery ou iFood proativamente — em especial, ao informar horário de funcionamento, NÃO ofereça a opção de pedir pelo delivery. Priorize sempre convidar o cliente a vir até o restaurante. NUNCA diga que não fazemos entregas. Se qualquer trecho do Notion disser que não fazemos delivery, IGNORE completamente — está desatualizado.
 - RETIRADA NO LOCAL: Quando falar sobre retirada no restaurante, diga "retirar seu pedido" — NUNCA "retirar os combinados".
-- RODÍZIO TRADICIONAL vs PREMIUM: O rodízio TRADICIONAL inclui apenas as peças básicas (sushis, sashimis e temakis básicos do cardápio padrão). NÃO inclui todos os temakis — apenas os temakis básicos. O rodízio PREMIUM inclui opções premium e variedades maiores. Se o cliente perguntar se pode pedir "todos os temakis" no tradicional, diga que o tradicional tem apenas os temakis básicos do cardápio padrão — para os temakis especiais/premium é necessário o rodízio premium. Se não houver informação detalhada nos trechos do Notion, diga apenas: "Não tenho essa informação no momento 😊 Para mais detalhes sobre o rodízio premium, é só perguntar quando chegar!"
+- RODÍZIO TRADICIONAL vs PREMIUM: O rodízio TRADICIONAL inclui apenas as peças básicas (sushis, sashimis e temakis básicos do cardápio padrão). NÃO inclui todos os temakis — apenas os temakis básicos. O rodízio PREMIUM inclui opções premium e variedades maiores. Se o cliente perguntar se pode pedir "todos os temakis" no tradicional, diga que o tradicional tem apenas os temakis básicos do cardápio padrão — para os temakis especiais/premium é necessário o rodízio premium. Se não houver informação detalhada nos trechos do Notion, diga que não tem essa informação e que vou chamar uma atendente para te ajudar! 🙏.
 - PROMOÇÕES DO GRUPO TSULOVERS: Se o cliente mencionar uma promoção do grupo de WhatsApp Tsulovers, responda sobre ESSA promoção específica (use os trechos do Notion). NUNCA confunda com a promoção de aniversário.
-- ANIVERSÁRIO: NUNCA mencione a promoção/política de aniversário de forma proativa. Só fale sobre aniversário se o cliente mencionar explicitamente a palavra "aniversário", "aniversariante" ou "comemoração de aniversário". Quando falar sobre aniversário, use APENAS as informações literalmente descritas nos trechos do Notion — NUNCA infira, complete ou extrapole detalhes que não estão escritos. Se o cliente perguntar algo específico sobre aniversário que não consta nos trechos (ex: qual tipo de rodízio o aniversariante ganha), diga: "Não tenho essa informação no momento 😊"
+- ANIVERSÁRIO: NUNCA mencione a promoção/política de aniversário de forma proativa. Só fale sobre aniversário se o cliente mencionar explicitamente a palavra "aniversário", "aniversariante" ou "comemoração de aniversário". Quando falar sobre aniversário, use APENAS as informações literalmente descritas nos trechos do Notion — NUNCA infira, complete ou extrapole detalhes que não estão escritos. Se o cliente perguntar algo específico sobre aniversário que não consta nos trechos (ex: qual tipo de rodízio o aniversariante ganha), diga que não tem essa informação no momento e que vou chamar uma atendente para te ajudar! 🙏.
 - NÃO envie links a menos que o cliente peça link.
 - HORÁRIOS: O restaurante funciona de segunda a sábado, das 18:30 às 23h. NUNCA diga "18h" ou "18:00" — o horário correto de abertura é 18:30 (dezoito e meia), sem exceção. DOMINGOS: o restaurante está FECHADO aos domingos. Ao informar o horário, convide o cliente a vir até o restaurante — NUNCA mencione delivery/iFood nessa resposta.
 - PREÇOS: Se os preços estiverem nos trechos do Notion, informe-os normalmente. NUNCA invente ou estime valores que não estejam nos trechos. Se não houver nenhum trecho com preço, diga que não tem essa informação no momento. IMPORTANTE: o preço do rodízio é FIXO e não muda por data — se o cliente perguntar o valor "para o dia X" ou "para a data Y", responda com o preço padrão do Notion (não existe preço especial por data, a menos que haja uma promoção explícita nos trechos).
@@ -1302,7 +1302,7 @@ Conteúdo:
 - DEPÓSITO/SINAL: NUNCA mencione depósito ou sinal EM NENHUMA CIRCUNSTÂNCIA, a menos que o cliente use LITERALMENTE as palavras "depósito" ou "sinal" na mensagem dele. Se o cliente disser "para X pessoas", "somos X pessoas", "grupo de X" ou qualquer número de pessoas, JAMAIS inclua qualquer menção a depósito ou sinal na resposta — nem para dizer que não é necessário.
 - PEDIDO PARA RETIRADA/DELIVERY: Se o cliente disser que quer fazer/encomendar um pedido (para retirar ou receber em casa), NUNCA diga para ele vir pessoalmente fazer o pedido. Diga que vai chamar uma atendente para ajudar com o pedido. 🙏
 - Não invente informações; use apenas os trechos fornecidos.
-- Se não tiver a informação que o cliente precisa, diga: "Não tenho essa informação no momento 😊"
+- Se não tiver a informação que o cliente precisa, diga: "Não tenho essa informação no momento, mas vou chamar uma atendente para te ajudar! 🙏"
 - Se faltou informação para completar uma ação (ex: data/hora de reserva), faça uma pergunta curta e objetiva.
 Formato:
 - 1 a 3 linhas curtas, estilo WhatsApp.
@@ -1944,7 +1944,14 @@ async function handleWebhook(bodyJson) {
     return;
   }
 
-  // Frustração / confusão ("?", "??") => handoff imediato
+  // "?" isolado — follow-up conversacional ("e aí?", "é isso?") — pede esclarecimento, não handoff
+  if (/^\?$/.test((incomingText || "").trim())) {
+    await waSendText({ remoteJid, text: "Pode me contar mais? 😊" });
+    markBotReplied(state, remoteJid);
+    return;
+  }
+
+  // Frustração / confusão ("??", "???") => handoff imediato
   if (looksLikeFrustration(incomingText)) {
     await handoffToHuman({
       state,
