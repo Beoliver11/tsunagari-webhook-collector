@@ -1944,13 +1944,6 @@ async function handleWebhook(bodyJson) {
     return;
   }
 
-  // "?" isolado — follow-up conversacional ("e aí?", "é isso?") — pede esclarecimento, não handoff
-  if (/^\?$/.test((incomingText || "").trim())) {
-    await waSendText({ remoteJid, text: "Pode me contar mais? 😊" });
-    markBotReplied(state, remoteJid);
-    return;
-  }
-
   // Frustração / confusão ("??", "???") => handoff imediato
   if (looksLikeFrustration(incomingText)) {
     await handoffToHuman({
